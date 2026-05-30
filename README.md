@@ -41,3 +41,13 @@ Example `.codex/hooks.json`:
 ```
 
 Run `polaris init` in a workspace before expecting hook output. If `.polaris/` is absent, the hook exits successfully without output.
+
+## Codex Skill
+
+This repository includes a copyable Codex skill at `skills/codex/polaris/`. To install it into a Codex environment, copy the folder into your skills directory:
+
+```bash
+cp -R skills/codex/polaris ~/.codex/skills/
+```
+
+The bundled skill is intentionally minimal. It only requires `SKILL.md`; it does not include or require `agents/openai.yaml`.
