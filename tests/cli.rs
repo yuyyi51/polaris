@@ -286,3 +286,32 @@ fn session_start_hook_is_quiet_unless_compact_initialized_and_has_memory() {
     assert!(context.contains("polaris recall"));
     assert!(!context.contains("secret memory"));
 }
+
+#[test]
+fn codex_hook_example_configures_compact_session_recall() {
+    let example_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("codex-hooks")
+        .join("hooks.json");
+    let example = fs::read_to_string(&example_path).expect("example hooks.json exists");
+    let hooks: Value = serde_json::from_str(&example).expect("example hooks.json is valid JSON");
+
+    let session_start_hooks = hooks["hooks"]["SessionStart"]
+        .as_array()
+        .expect("SessionStart hook list exists");
+    let compact_hook = session_start_hooks
+        .iter()
+        .find(|hook| hook["matcher"] == "compact")
+        .expect("compact SessionStart hook exists");
+    let command_hooks = compact_hook["hooks"]
+        .as_array()
+        .expect("compact SessionStart command hooks exist");
+    let command_hook = command_hooks
+        .iter()
+        .find(|hook| hook["command"] == "polaris hook session-start")
+        .expect("Polaris session-start hook command exists");
+
+    assert_eq!(command_hook["type"], "command");
+    assert!(command_hook.get("statusMessage").is_some());
+    assert_eq!(command_hooks.len(), 1);
+}

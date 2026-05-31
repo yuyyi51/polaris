@@ -19,7 +19,7 @@ polaris hook session-start
 
 Configure Codex to call Polaris on compact session starts. The hook only asks the agent to run `polaris recall`; it does not inline stored memory.
 
-Example `.codex/hooks.json`:
+Copy the example at `examples/codex-hooks/hooks.json` into your Codex hooks configuration, or adapt this `.codex/hooks.json` snippet:
 
 ```json
 {
@@ -39,6 +39,8 @@ Example `.codex/hooks.json`:
   }
 }
 ```
+
+The example assumes `polaris` is available on `PATH`. If you install the binary somewhere else, replace `polaris hook session-start` with the appropriate absolute command path.
 
 Run `polaris init` in a workspace before expecting hook output. If `.polaris/` is absent, the hook exits successfully without output.
 

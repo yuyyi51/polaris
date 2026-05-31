@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "polaris hook session-start",
+            "statusMessage": "Checking Polaris recall"
+          }
+        ]
+      }
+    ]
+  }
+}
