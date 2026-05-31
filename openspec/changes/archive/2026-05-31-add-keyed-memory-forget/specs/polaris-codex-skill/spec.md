@@ -1,33 +1,4 @@
-# polaris-codex-skill Specification
-
-## Purpose
-TBD - created by archiving change add-polaris-codex-skill. Update Purpose after archive.
-## Requirements
-### Requirement: Project-bundled Codex skill
-The repository SHALL provide a Codex-compatible Polaris skill under `skills/codex/polaris/`.
-
-#### Scenario: Skill folder is copyable
-- **WHEN** a user copies `skills/codex/polaris/` into a Codex skills directory
-- **THEN** the copied folder contains the files needed for Codex to discover and load the Polaris skill
-
-#### Scenario: Skill uses minimum required file set
-- **WHEN** the project provides `skills/codex/polaris/`
-- **THEN** the skill folder contains `SKILL.md` and MUST NOT require `agents/openai.yaml`
-
-#### Scenario: Skill uses valid frontmatter
-- **WHEN** Codex reads `skills/codex/polaris/SKILL.md`
-- **THEN** the file contains valid YAML frontmatter with `name` and `description`
-
-### Requirement: Polaris recovery instruction
-The skill SHALL instruct agents to run `polaris recall` immediately when context tells them to recall Polaris memory.
-
-#### Scenario: Compact reminder is present
-- **WHEN** an agent using the skill sees a compact-session reminder to run `polaris recall`
-- **THEN** the skill directs the agent to run `polaris recall` before doing other work
-
-#### Scenario: Recall fails
-- **WHEN** `polaris recall` fails because Polaris is unavailable or not initialized
-- **THEN** the skill directs the agent to report the failure briefly and continue with available context
+## MODIFIED Requirements
 
 ### Requirement: Start and resume workflow guidance
 The skill SHALL teach agents how to start or resume substantial work with Polaris.
@@ -67,15 +38,3 @@ The skill SHALL teach agents what keyed information to save in Polaris and which
 #### Scenario: Sensitive information appears
 - **WHEN** task context includes secrets, tokens, passwords, credentials, or private keys
 - **THEN** the skill directs the agent not to store that information in Polaris
-
-### Requirement: Skill validation
-The project SHALL include validation steps for the bundled Polaris skill.
-
-#### Scenario: Skill implementation is complete
-- **WHEN** the Polaris skill files are created or updated
-- **THEN** the implementation is validated with the skill-creator quick validation script when available
-
-#### Scenario: Project checks run
-- **WHEN** the Polaris skill change is completed
-- **THEN** existing project verification commands still pass
-

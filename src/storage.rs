@@ -28,6 +28,8 @@ pub struct MemoryRecord {
     pub created_at: String,
     pub kind: MemoryKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -43,6 +45,7 @@ pub enum MemoryKind {
 }
 
 pub struct MemoryInput {
+    pub key: String,
     pub title: Option<String>,
     pub text: String,
 }
@@ -119,17 +122,71 @@ impl PolarisStore {
         })
     }
 
-    pub fn remember(&self, input: MemoryInput) -> Result<MemoryRecord> {
+    pub fn remember(&self, input: MemoryInput, replace: bool) -> Result<MemoryRecord> {
         let record = MemoryRecord {
             id: new_id(),
             created_at: now(),
             kind: MemoryKind::Inline,
+            key: Some(input.key.clone()),
             title: input.title,
             text: Some(input.text),
             path: None,
         };
-        self.append_record(&record)?;
-        Ok(record)
+
+        let mut records = self.load_records()?;
+        let existing = records
+            .iter()
+            .any(|record| record.is_inline_key(&input.key));
+        if existing {
+            if !replace {
+                return Err(anyhow!(
+                    "memory key `{}` already exists; use --replace to overwrite it",
+                    input.key
+                ));
+            }
+            records.retain(|record| !record.is_inline_key(&input.key));
+            records.push(record);
+            self.write_records(&records)?;
+            Ok(records.pop().expect("record was just pushed"))
+        } else {
+            self.append_record(&record)?;
+            Ok(record)
+        }
+    }
+
+    pub fn forget(&self, key: &str) -> Result<()> {
+        let mut records = self.load_records()?;
+        let original_len = records.len();
+        records.retain(|record| !record.is_inline_key(key));
+        if records.len() == original_len {
+            return Err(anyhow!("No memory exists for key `{key}`"));
+        }
+        self.write_records(&records)
+    }
+
+    fn write_records(&self, records: &[MemoryRecord]) -> Result<()> {
+        let temp_path = self
+            .root()
+            .join(format!(".{MEMORIES_FILE}.{}.tmp", new_id()));
+        {
+            let mut file = File::create(&temp_path).with_context(|| {
+                format!(
+                    "failed to create temporary memory file {}",
+                    temp_path.display()
+                )
+            })?;
+            for record in records {
+                writeln!(file, "{}", serde_json::to_string(record)?)?;
+            }
+        }
+        fs::rename(&temp_path, self.memories_file()).with_context(|| {
+            format!(
+                "failed to replace {} with {}",
+                self.memories_file().display(),
+                temp_path.display()
+            )
+        })?;
+        Ok(())
     }
 
     pub fn create_note(&self, title: &str) -> Result<CreatedNote> {
@@ -143,6 +200,7 @@ impl PolarisStore {
             id: id.clone(),
             created_at: now(),
             kind: MemoryKind::Note,
+            key: None,
             title: Some(title.to_string()),
             text: None,
             path: Some(relative_path.display().to_string()),
@@ -166,10 +224,14 @@ impl PolarisStore {
             let title = record
                 .title
                 .clone()
+                .or_else(|| record.key.clone())
                 .unwrap_or_else(|| format!("Memory {}", record.id));
             match record.kind {
                 MemoryKind::Inline => {
                     output.push_str(&format!("## {title}\n"));
+                    if let Some(key) = record.key.as_deref() {
+                        output.push_str(&format!("- Key: {key}\n"));
+                    }
                     output.push_str(record.text.as_deref().unwrap_or(""));
                     output.push_str("\n\n");
                 }
@@ -251,6 +313,12 @@ impl PolarisStore {
 
     fn docs_dir(&self) -> PathBuf {
         self.root().join(DOCS_DIR)
+    }
+}
+
+impl MemoryRecord {
+    fn is_inline_key(&self, key: &str) -> bool {
+        matches!(self.kind, MemoryKind::Inline) && self.key.as_deref() == Some(key)
     }
 }
 

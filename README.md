@@ -7,13 +7,17 @@ Polaris is a Rust CLI for storing workspace-local agent context under `.polaris/
 ```bash
 polaris init
 polaris status --json
-polaris remember --text "task goal" --title "Goal"
-polaris remember --stdin --title "Decision"
+polaris remember --key goal --text "task goal" --title "Goal"
+polaris remember --key decision --stdin --title "Decision"
+polaris remember --key goal --replace --text "updated task goal"
+polaris forget goal
 polaris note create --title "Architecture notes"
 polaris recall
 polaris clear --yes
 polaris hook session-start
 ```
+
+Inline memories are keyed. Use a short stable key such as `goal`, `plan`, `decision.storage`, `blocker`, or `verification`. Reusing a key fails unless `--replace` is provided, which makes overwrites explicit. Use `polaris forget <key>` to remove one keyed inline memory, or `polaris clear --yes` to clear all Polaris memory and note files.
 
 ## Codex Hook
 

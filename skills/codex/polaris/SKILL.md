@@ -39,9 +39,10 @@ polaris init
 polaris recall
 ```
 
-4. If existing memory appears unrelated or stale, ask the user before clearing it.
+4. If existing memory appears unrelated or stale, ask the user before removing it. Use `polaris forget <key>` for selected keyed inline memory, or `polaris clear --yes` only when clearing all Polaris memory.
 
 ```bash
+polaris forget goal
 polaris clear --yes
 ```
 
@@ -59,16 +60,22 @@ Before starting meaningful work, record the task facts that would matter after c
 For short context:
 
 ```bash
-polaris remember --text "Implement the Polaris Codex skill under skills/codex/polaris." --title "Goal"
+polaris remember --key goal --text "Implement keyed Polaris memory and forget support." --title "Goal"
 ```
 
 For multi-line context:
 
 ```bash
 printf '%s\n' "Key decisions:
-- The skill is copyable from skills/codex/polaris/.
-- It only requires SKILL.md.
-- It must not require agents/openai.yaml." | polaris remember --stdin --title "Polaris skill decisions"
+- Inline memory uses required keys.
+- Duplicate keys fail unless --replace is used.
+- Use forget for selected keyed memory." | polaris remember --key decisions.memory --stdin --title "Memory decisions"
+```
+
+Use stable keys such as `goal`, `plan`, `decision.storage`, `blocker`, and `verification`. If a key already exists and the remembered fact should change, replace it explicitly:
+
+```bash
+polaris remember --key goal --replace --text "Implement keyed memory replacement and forgetting."
 ```
 
 For long context, create a note and write details to the returned path:
@@ -82,8 +89,8 @@ polaris note create --title "Implementation notes"
 Update Polaris whenever durable task state changes:
 
 ```bash
-polaris remember --title "Decision" --text "Use SessionStart source=compact as the recovery trigger."
-polaris remember --title "Verification" --text "cargo fmt, cargo test, and cargo clippy passed."
+polaris remember --key decision.hook --text "Use SessionStart source=compact as the recovery trigger." --title "Decision"
+polaris remember --key verification --replace --text "cargo fmt, cargo test, and cargo clippy passed." --title "Verification"
 ```
 
 Refresh memory before major pauses, risky edits, or handoffs.

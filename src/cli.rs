@@ -20,6 +20,7 @@ enum Command {
     Init,
     Status(StatusArgs),
     Remember(RememberArgs),
+    Forget(ForgetArgs),
     Note(NoteArgs),
     Recall,
     Clear(ClearArgs),
@@ -34,12 +35,21 @@ struct StatusArgs {
 
 #[derive(Args)]
 struct RememberArgs {
+    #[arg(long)]
+    key: Option<String>,
     #[arg(long, conflicts_with = "stdin")]
     text: Option<String>,
     #[arg(long)]
     stdin: bool,
     #[arg(long)]
     title: Option<String>,
+    #[arg(long)]
+    replace: bool,
+}
+
+#[derive(Args)]
+struct ForgetArgs {
+    key: String,
 }
 
 #[derive(Args)]
@@ -96,6 +106,10 @@ pub fn run() -> Result<()> {
         Command::Remember(args) => {
             let store = PolarisStore::from_current_dir()?;
             store.require_initialized()?;
+            let key = args
+                .key
+                .filter(|key| !key.trim().is_empty())
+                .ok_or_else(|| anyhow!("remember requires --key <key>"))?;
             let text = if args.stdin {
                 let mut input = String::new();
                 io::stdin().read_to_string(&mut input)?;
@@ -104,11 +118,21 @@ pub fn run() -> Result<()> {
                 args.text
                     .ok_or_else(|| anyhow!("remember requires --text <text> or --stdin"))?
             };
-            let record = store.remember(MemoryInput {
-                title: args.title,
-                text,
-            })?;
+            let record = store.remember(
+                MemoryInput {
+                    key,
+                    title: args.title,
+                    text,
+                },
+                args.replace,
+            )?;
             println!("Recorded memory {}", record.id);
+        }
+        Command::Forget(args) => {
+            let store = PolarisStore::from_current_dir()?;
+            store.require_initialized()?;
+            store.forget(&args.key)?;
+            println!("Forgot memory {}", args.key);
         }
         Command::Note(args) => match args.command {
             NoteCommand::Create(args) => {

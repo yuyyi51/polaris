@@ -33,7 +33,15 @@ fn init_creates_workspace_memory_idempotently() {
 
     polaris()
         .current_dir(dir.path())
-        .args(["remember", "--text", "survives reinit", "--title", "Goal"])
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--text",
+            "survives reinit",
+            "--title",
+            "Goal",
+        ])
         .assert()
         .success();
 
@@ -69,7 +77,15 @@ fn status_reports_uninitialized_and_initialized_counts() {
     init_workspace(dir.path());
     polaris()
         .current_dir(dir.path())
-        .args(["remember", "--text", "keep the goal", "--title", "Goal"])
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--text",
+            "keep the goal",
+            "--title",
+            "Goal",
+        ])
         .assert()
         .success();
     polaris()
@@ -99,7 +115,7 @@ fn remember_rejects_before_init_and_records_text_and_stdin() {
 
     polaris()
         .current_dir(dir.path())
-        .args(["remember", "--text", "nope"])
+        .args(["remember", "--key", "goal", "--text", "nope"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("polaris init"));
@@ -107,19 +123,203 @@ fn remember_rejects_before_init_and_records_text_and_stdin() {
     init_workspace(dir.path());
     polaris()
         .current_dir(dir.path())
-        .args(["remember", "--text", "task goal", "--title", "Goal"])
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--text",
+            "task goal",
+            "--title",
+            "Goal",
+        ])
         .assert()
         .success();
     polaris()
         .current_dir(dir.path())
-        .args(["remember", "--stdin", "--title", "Decision"])
+        .args([
+            "remember", "--key", "decision", "--stdin", "--title", "Decision",
+        ])
         .write_stdin("use SessionStart compact\n")
         .assert()
         .success();
 
     let memories = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+    assert!(memories.contains("\"key\":\"goal\""));
+    assert!(memories.contains("\"key\":\"decision\""));
     assert!(memories.contains("task goal"));
     assert!(memories.contains("use SessionStart compact"));
+}
+
+#[test]
+fn remember_requires_key_and_rejects_duplicate_without_replace() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--text", "missing key"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--key"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "first goal"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "second goal"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"))
+        .stderr(predicate::str::contains("--replace"));
+
+    let recall = polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let recall = String::from_utf8(recall).unwrap();
+    assert!(recall.contains("first goal"));
+    assert!(!recall.contains("second goal"));
+}
+
+#[test]
+fn remember_replace_overwrites_keyed_memory() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "first goal"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--replace",
+            "--text",
+            "replacement goal",
+        ])
+        .assert()
+        .success();
+
+    let recall = polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let recall = String::from_utf8(recall).unwrap();
+    assert!(recall.contains("Key: goal"));
+    assert!(recall.contains("replacement goal"));
+    assert!(!recall.contains("first goal"));
+
+    let memories = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+    assert_eq!(memories.matches("\"key\":\"goal\"").count(), 1);
+}
+
+#[test]
+fn forget_removes_keyed_memory_and_preserves_unrelated_records() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "forget me"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "plan", "--text", "keep me"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["note", "create", "--title", "Architecture notes"])
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "goal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Forgot memory goal"));
+
+    let recall = polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let recall = String::from_utf8(recall).unwrap();
+    assert!(!recall.contains("forget me"));
+    assert!(recall.contains("keep me"));
+    assert!(recall.contains("Architecture notes"));
+}
+
+#[test]
+fn forget_rejects_unknown_key_and_missing_workspace() {
+    let dir = temp_workspace();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "goal"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("polaris init"));
+
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "keep me"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No memory exists for key `missing`",
+        ));
+
+    polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("keep me"));
+}
+
+#[test]
+fn recall_preserves_legacy_unkeyed_inline_memory() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    fs::write(
+        dir.path().join(".polaris/memories.jsonl"),
+        r#"{"id":"legacy","created_at":"2026-05-31T00:00:00Z","kind":"inline","title":"Legacy","text":"old memory"}"#,
+    )
+    .unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("old memory"));
 }
 
 #[test]
@@ -129,7 +329,15 @@ fn note_create_records_markdown_file_and_recall_lists_context() {
 
     polaris()
         .current_dir(dir.path())
-        .args(["remember", "--text", "keep scope small", "--title", "Scope"])
+        .args([
+            "remember",
+            "--key",
+            "scope",
+            "--text",
+            "keep scope small",
+            "--title",
+            "Scope",
+        ])
         .assert()
         .success();
     let output = polaris()
@@ -183,7 +391,7 @@ fn clear_requires_confirmation_and_preserves_initialization() {
     init_workspace(dir.path());
     polaris()
         .current_dir(dir.path())
-        .args(["remember", "--text", "stale"])
+        .args(["remember", "--key", "stale", "--text", "stale"])
         .assert()
         .success();
     let output = polaris()
@@ -251,7 +459,7 @@ fn session_start_hook_is_quiet_unless_compact_initialized_and_has_memory() {
 
     polaris()
         .current_dir(dir.path())
-        .args(["remember", "--text", "secret memory"])
+        .args(["remember", "--key", "secret", "--text", "secret memory"])
         .assert()
         .success();
 
