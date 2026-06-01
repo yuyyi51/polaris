@@ -85,6 +85,10 @@ struct HookArgs {
 enum HookCommand {
     #[command(name = "session-start")]
     SessionStart,
+    #[command(name = "post-compact")]
+    PostCompact,
+    #[command(name = "post-tool-use")]
+    PostToolUse,
 }
 
 pub fn run() -> Result<()> {
@@ -162,6 +166,20 @@ pub fn run() -> Result<()> {
                 let mut input = String::new();
                 io::stdin().read_to_string(&mut input)?;
                 if let Some(output) = hook::session_start_output(&input, |cwd: PathBuf| {
+                    PolarisStore::from_workspace(cwd)
+                })? {
+                    println!("{}", serde_json::to_string(&output)?);
+                }
+            }
+            HookCommand::PostCompact => {
+                let mut input = String::new();
+                io::stdin().read_to_string(&mut input)?;
+                hook::post_compact(&input, |cwd: PathBuf| PolarisStore::from_workspace(cwd))?;
+            }
+            HookCommand::PostToolUse => {
+                let mut input = String::new();
+                io::stdin().read_to_string(&mut input)?;
+                if let Some(output) = hook::post_tool_use_output(&input, |cwd: PathBuf| {
                     PolarisStore::from_workspace(cwd)
                 })? {
                     println!("{}", serde_json::to_string(&output)?);

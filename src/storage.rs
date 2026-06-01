@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 const POLARIS_DIR: &str = ".polaris";
 const STATE_FILE: &str = "state.json";
+const HOOK_STATE_FILE: &str = "hook-state.json";
 const MEMORIES_FILE: &str = "memories.jsonl";
 const DOCS_DIR: &str = "docs";
 
@@ -20,6 +21,13 @@ pub struct PolarisStore {
 struct State {
     schema_version: u8,
     created_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HookState {
+    schema_version: u8,
+    compact_recall_pending: bool,
+    recorded_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -249,6 +257,10 @@ impl PolarisStore {
 
     pub fn clear(&self) -> Result<()> {
         fs::write(self.memories_file(), "")?;
+        let hook_state_file = self.hook_state_file();
+        if hook_state_file.exists() {
+            fs::remove_file(hook_state_file)?;
+        }
         if self.docs_dir().exists() {
             for entry in fs::read_dir(self.docs_dir())? {
                 let entry = entry?;
@@ -265,6 +277,33 @@ impl PolarisStore {
 
     pub fn memory_count(&self) -> Result<usize> {
         Ok(self.load_records()?.len())
+    }
+
+    pub fn mark_compact_recall_pending(&self) -> Result<()> {
+        let state = HookState {
+            schema_version: 1,
+            compact_recall_pending: true,
+            recorded_at: now(),
+        };
+        fs::write(
+            self.hook_state_file(),
+            serde_json::to_string_pretty(&state)?,
+        )?;
+        Ok(())
+    }
+
+    pub fn consume_compact_recall_pending(&self) -> Result<bool> {
+        let path = self.hook_state_file();
+        if !path.exists() {
+            return Ok(false);
+        }
+
+        let state: HookState = serde_json::from_str(
+            &fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?,
+        )?;
+        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+        Ok(state.compact_recall_pending)
     }
 
     fn document_count(&self) -> Result<usize> {
@@ -305,6 +344,10 @@ impl PolarisStore {
 
     fn state_file(&self) -> PathBuf {
         self.root().join(STATE_FILE)
+    }
+
+    fn hook_state_file(&self) -> PathBuf {
+        self.root().join(HOOK_STATE_FILE)
     }
 
     fn memories_file(&self) -> PathBuf {

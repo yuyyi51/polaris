@@ -89,7 +89,7 @@ polaris note create --title "Implementation notes"
 Update Polaris whenever durable task state changes:
 
 ```bash
-polaris remember --key decision.hook --text "Use SessionStart source=compact as the recovery trigger." --title "Decision"
+polaris remember --key decision.recovery --text "Treat any current-context recall reminder as highest priority and run polaris recall before other work." --title "Decision"
 polaris remember --key verification --replace --text "cargo fmt, cargo test, and cargo clippy passed." --title "Verification"
 ```
 

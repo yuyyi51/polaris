@@ -496,6 +496,156 @@ fn session_start_hook_is_quiet_unless_compact_initialized_and_has_memory() {
 }
 
 #[test]
+fn post_compact_fallback_hook_records_pending_and_post_tool_use_prompts_once() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "secret", "--text", "secret memory"])
+        .assert()
+        .success();
+
+    let post_compact_input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .args(["hook", "post-compact"])
+        .write_stdin(post_compact_input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    let hook_state =
+        fs::read_to_string(dir.path().join(".polaris/hook-state.json")).expect("hook state exists");
+    assert!(hook_state.contains("\"compact_recall_pending\": true"));
+
+    let post_tool_input = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["hook", "post-tool-use"])
+        .write_stdin(post_tool_input.as_str())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let hook: Value = serde_json::from_slice(&output).expect("hook json");
+    let context = hook["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additional context");
+    assert_eq!(hook["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    assert!(context.contains("polaris recall"));
+    assert!(!context.contains("secret memory"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["hook", "post-tool-use"])
+        .write_stdin(post_tool_input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn post_compact_fallback_hook_is_quiet_without_memory_or_initialization_or_matching_events() {
+    let dir = temp_workspace();
+    let post_compact_input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["hook", "post-compact"])
+        .write_stdin(post_compact_input.as_str())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    assert!(!dir.path().join(".polaris/hook-state.json").exists());
+
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["hook", "post-compact"])
+        .write_stdin(post_compact_input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    let post_tool_input = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .args(["hook", "post-tool-use"])
+        .write_stdin(post_tool_input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    let mismatched_input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .args(["hook", "post-compact"])
+        .write_stdin(mismatched_input.as_str())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    polaris()
+        .current_dir(dir.path())
+        .args(["hook", "post-tool-use"])
+        .write_stdin(mismatched_input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn clear_removes_pending_post_compact_hook_state() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "task goal"])
+        .assert()
+        .success();
+    let post_compact_input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .args(["hook", "post-compact"])
+        .write_stdin(post_compact_input)
+        .assert()
+        .success();
+    assert!(dir.path().join(".polaris/hook-state.json").is_file());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["clear", "--yes"])
+        .assert()
+        .success();
+
+    assert!(!dir.path().join(".polaris/hook-state.json").exists());
+}
+
+#[test]
 fn codex_hook_example_configures_compact_session_recall() {
     let example_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
@@ -522,4 +672,40 @@ fn codex_hook_example_configures_compact_session_recall() {
     assert_eq!(command_hook["type"], "command");
     assert!(command_hook.get("statusMessage").is_some());
     assert_eq!(command_hooks.len(), 1);
+}
+
+#[test]
+fn codex_fallback_hook_example_configures_post_compact_recall() {
+    let example_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("codex-hooks")
+        .join("post-compact-hooks.json");
+    let example = fs::read_to_string(&example_path).expect("fallback hooks.json exists");
+    let hooks: Value = serde_json::from_str(&example).expect("fallback hooks.json is valid JSON");
+
+    let post_compact_hooks = hooks["hooks"]["PostCompact"]
+        .as_array()
+        .expect("PostCompact hook list exists");
+    let post_compact_command_hooks = post_compact_hooks
+        .first()
+        .and_then(|hook| hook["hooks"].as_array())
+        .expect("PostCompact command hooks exist");
+    let post_compact_command = post_compact_command_hooks
+        .iter()
+        .find(|hook| hook["command"] == "polaris hook post-compact")
+        .expect("Polaris post-compact hook command exists");
+    assert_eq!(post_compact_command["type"], "command");
+
+    let post_tool_use_hooks = hooks["hooks"]["PostToolUse"]
+        .as_array()
+        .expect("PostToolUse hook list exists");
+    let post_tool_use_command_hooks = post_tool_use_hooks
+        .first()
+        .and_then(|hook| hook["hooks"].as_array())
+        .expect("PostToolUse command hooks exist");
+    let post_tool_use_command = post_tool_use_command_hooks
+        .iter()
+        .find(|hook| hook["command"] == "polaris hook post-tool-use")
+        .expect("Polaris post-tool-use hook command exists");
+    assert_eq!(post_tool_use_command["type"], "command");
 }

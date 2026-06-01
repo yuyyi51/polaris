@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "polaris hook post-compact",
+            "statusMessage": "Recording Polaris compact state"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "polaris hook post-tool-use",
+            "statusMessage": "Checking Polaris recall"
+          }
+        ]
+      }
+    ]
+  }
+}

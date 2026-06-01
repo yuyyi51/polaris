@@ -15,15 +15,17 @@ polaris note create --title "Architecture notes"
 polaris recall
 polaris clear --yes
 polaris hook session-start
+polaris hook post-compact
+polaris hook post-tool-use
 ```
 
 Inline memories are keyed. Use a short stable key such as `goal`, `plan`, `decision.storage`, `blocker`, or `verification`. Reusing a key fails unless `--replace` is provided, which makes overwrites explicit. Use `polaris forget <key>` to remove one keyed inline memory, or `polaris clear --yes` to clear all Polaris memory and note files.
 
 ## Codex Hook
 
-Configure Codex to call Polaris on compact session starts. The hook only asks the agent to run `polaris recall`; it does not inline stored memory.
+Configure your agent CLI to call Polaris after conversation compaction. Hook commands only ask the agent to run `polaris recall`; they do not inline stored memory.
 
-Copy the example at `examples/codex-hooks/hooks.json` into your Codex hooks configuration, or adapt this `.codex/hooks.json` snippet:
+If your CLI supports compact `SessionStart` hooks, use the direct example at `examples/codex-hooks/hooks.json`, or adapt this `.codex/hooks.json` snippet:
 
 ```json
 {
@@ -44,9 +46,11 @@ Copy the example at `examples/codex-hooks/hooks.json` into your Codex hooks conf
 }
 ```
 
-The example assumes `polaris` is available on `PATH`. If you install the binary somewhere else, replace `polaris hook session-start` with the appropriate absolute command path.
+If your CLI does not trigger a compact `SessionStart` hook after compaction, use the fallback example at `examples/codex-hooks/post-compact-hooks.json`. It records compact completion with `polaris hook post-compact`, then checks that pending state on `polaris hook post-tool-use`.
 
-Run `polaris init` in a workspace before expecting hook output. If `.polaris/` is absent, the hook exits successfully without output.
+The examples assume `polaris` is available on `PATH`. If you install the binary somewhere else, replace the `polaris hook ...` commands with the appropriate absolute command path.
+
+Run `polaris init` in a workspace before expecting hook output. If `.polaris/` is absent, hook commands exit successfully without output.
 
 ## Codex Skill
 
