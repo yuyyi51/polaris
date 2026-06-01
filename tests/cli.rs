@@ -17,6 +17,14 @@ fn init_workspace(dir: &Path) {
     polaris().current_dir(dir).arg("init").assert().success();
 }
 
+fn hook_context(output: &[u8]) -> String {
+    let hook: Value = serde_json::from_slice(output).expect("hook json");
+    hook["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additional context")
+        .to_string()
+}
+
 #[test]
 fn init_creates_workspace_memory_idempotently() {
     let dir = temp_workspace();
@@ -433,6 +441,7 @@ fn clear_requires_confirmation_and_preserves_initialization() {
 #[test]
 fn session_start_hook_is_quiet_unless_compact_initialized_and_has_memory() {
     let dir = temp_workspace();
+    let home = temp_workspace();
     let compact_input = serde_json::json!({
         "hook_event_name": "SessionStart",
         "source": "compact",
@@ -442,6 +451,7 @@ fn session_start_hook_is_quiet_unless_compact_initialized_and_has_memory() {
 
     polaris()
         .current_dir(dir.path())
+        .env("HOME", home.path())
         .args(["hook", "session-start"])
         .write_stdin(compact_input.as_str())
         .assert()
@@ -451,6 +461,7 @@ fn session_start_hook_is_quiet_unless_compact_initialized_and_has_memory() {
     init_workspace(dir.path());
     polaris()
         .current_dir(dir.path())
+        .env("HOME", home.path())
         .args(["hook", "session-start"])
         .write_stdin(compact_input.as_str())
         .assert()
@@ -471,6 +482,7 @@ fn session_start_hook_is_quiet_unless_compact_initialized_and_has_memory() {
     .to_string();
     polaris()
         .current_dir(dir.path())
+        .env("HOME", home.path())
         .args(["hook", "session-start"])
         .write_stdin(startup_input)
         .assert()
@@ -479,6 +491,7 @@ fn session_start_hook_is_quiet_unless_compact_initialized_and_has_memory() {
 
     let output = polaris()
         .current_dir(dir.path())
+        .env("HOME", home.path())
         .args(["hook", "session-start"])
         .write_stdin(compact_input)
         .assert()
@@ -487,9 +500,7 @@ fn session_start_hook_is_quiet_unless_compact_initialized_and_has_memory() {
         .stdout
         .clone();
     let hook: Value = serde_json::from_slice(&output).expect("hook json");
-    let context = hook["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .expect("additional context");
+    let context = hook_context(&output);
     assert_eq!(hook["hookSpecificOutput"]["hookEventName"], "SessionStart");
     assert!(context.contains("polaris recall"));
     assert!(!context.contains("secret memory"));
@@ -498,6 +509,7 @@ fn session_start_hook_is_quiet_unless_compact_initialized_and_has_memory() {
 #[test]
 fn post_compact_fallback_hook_records_pending_and_post_tool_use_prompts_once() {
     let dir = temp_workspace();
+    let home = temp_workspace();
     init_workspace(dir.path());
     polaris()
         .current_dir(dir.path())
@@ -512,6 +524,7 @@ fn post_compact_fallback_hook_records_pending_and_post_tool_use_prompts_once() {
     .to_string();
     polaris()
         .current_dir(dir.path())
+        .env("HOME", home.path())
         .args(["hook", "post-compact"])
         .write_stdin(post_compact_input)
         .assert()
@@ -529,6 +542,7 @@ fn post_compact_fallback_hook_records_pending_and_post_tool_use_prompts_once() {
     .to_string();
     let output = polaris()
         .current_dir(dir.path())
+        .env("HOME", home.path())
         .args(["hook", "post-tool-use"])
         .write_stdin(post_tool_input.as_str())
         .assert()
@@ -537,20 +551,210 @@ fn post_compact_fallback_hook_records_pending_and_post_tool_use_prompts_once() {
         .stdout
         .clone();
     let hook: Value = serde_json::from_slice(&output).expect("hook json");
-    let context = hook["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .expect("additional context");
+    let context = hook_context(&output);
     assert_eq!(hook["hookSpecificOutput"]["hookEventName"], "PostToolUse");
     assert!(context.contains("polaris recall"));
     assert!(!context.contains("secret memory"));
 
     polaris()
         .current_dir(dir.path())
+        .env("HOME", home.path())
         .args(["hook", "post-tool-use"])
         .write_stdin(post_tool_input)
         .assert()
         .success()
         .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn hook_uses_workspace_prompt_without_inlining_recall() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "secret", "--text", "secret memory"])
+        .assert()
+        .success();
+    fs::write(
+        dir.path().join(".polaris/config.toml"),
+        "[hooks]\nrecall_prompt = \"Custom workspace prompt\"\n",
+    )
+    .expect("write workspace config");
+
+    let compact_input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "session-start"])
+        .write_stdin(compact_input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let context = hook_context(&output);
+
+    assert_eq!(context, "Custom workspace prompt");
+    assert!(!context.contains("polaris recall"));
+    assert!(!context.contains("secret memory"));
+}
+
+#[test]
+fn hook_inlines_recall_when_workspace_prompt_contains_placeholder() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "inline memory"])
+        .assert()
+        .success();
+    fs::write(
+        dir.path().join(".polaris/config.toml"),
+        "[hooks]\nrecall_prompt = \"Before\\n{{recall}}\\nAfter\"\n",
+    )
+    .expect("write workspace config");
+
+    let compact_input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "session-start"])
+        .write_stdin(compact_input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let context = hook_context(&output);
+    assert!(context.starts_with("Before\n# Polaris Recall"));
+    assert!(context.contains("- Key: goal"));
+    assert!(context.contains("inline memory"));
+    assert!(context.ends_with("\nAfter"));
+
+    let post_compact_input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "post-compact"])
+        .write_stdin(post_compact_input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    let post_tool_input = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "post-tool-use"])
+        .write_stdin(post_tool_input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let context = hook_context(&output);
+    assert!(context.contains("# Polaris Recall"));
+    assert!(context.contains("inline memory"));
+}
+
+#[test]
+fn hook_prompt_prefers_workspace_config_and_falls_back_to_user_config() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "memory"])
+        .assert()
+        .success();
+    fs::create_dir_all(home.path().join(".polaris")).expect("create user polaris config dir");
+    fs::write(
+        home.path().join(".polaris/config.toml"),
+        "[hooks]\nrecall_prompt = \"User prompt\"\n",
+    )
+    .expect("write user config");
+
+    let compact_input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "session-start"])
+        .write_stdin(compact_input.as_str())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(hook_context(&output), "User prompt");
+
+    fs::write(
+        dir.path().join(".polaris/config.toml"),
+        "[hooks]\nrecall_prompt = \"Workspace prompt\"\n",
+    )
+    .expect("write workspace config");
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "session-start"])
+        .write_stdin(compact_input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(hook_context(&output), "Workspace prompt");
+}
+
+#[test]
+fn hook_reports_config_parse_errors_with_path() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "memory"])
+        .assert()
+        .success();
+    fs::write(dir.path().join(".polaris/config.toml"), "[hooks\n").expect("write invalid config");
+
+    let compact_input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "session-start"])
+        .write_stdin(compact_input)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(".polaris/config.toml"));
 }
 
 #[test]

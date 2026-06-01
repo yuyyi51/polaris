@@ -23,7 +23,7 @@ Inline memories are keyed. Use a short stable key such as `goal`, `plan`, `decis
 
 ## Codex Hook
 
-Configure your agent CLI to call Polaris after conversation compaction. Hook commands only ask the agent to run `polaris recall`; they do not inline stored memory.
+Configure your agent CLI to call Polaris after conversation compaction. By default, hook commands only ask the agent to run `polaris recall`; they do not inline stored memory.
 
 If your CLI supports compact `SessionStart` hooks, use the direct example at `examples/codex-hooks/hooks.json`, or adapt this `.codex/hooks.json` snippet:
 
@@ -51,6 +51,28 @@ If your CLI does not trigger a compact `SessionStart` hook after compaction, use
 The examples assume `polaris` is available on `PATH`. If you install the binary somewhere else, replace the `polaris hook ...` commands with the appropriate absolute command path.
 
 Run `polaris init` in a workspace before expecting hook output. If `.polaris/` is absent, hook commands exit successfully without output.
+
+To customize the hook prompt, add `[hooks].recall_prompt` to `.polaris/config.toml` in the workspace:
+
+```toml
+[hooks]
+recall_prompt = "Polaris has saved context. Run `polaris recall` before continuing."
+```
+
+If `.polaris/config.toml` is absent, Polaris checks `~/.polaris/config.toml`. Workspace config takes precedence over user config; the two files are not merged. If neither file exists, Polaris uses the built-in prompt.
+
+The only prompt placeholder is `{{recall}}`. When present, Polaris replaces every `{{recall}}` with the current `polaris recall` output and includes that text directly in hook context:
+
+```toml
+[hooks]
+recall_prompt = """
+Recovered Polaris context:
+
+{{recall}}
+"""
+```
+
+Using `{{recall}}` exposes `polaris recall` output to the agent context. Without that placeholder, a configured prompt is emitted as-is and stored memory is not inlined unless the prompt text itself contains it.
 
 ## Codex Skill
 
