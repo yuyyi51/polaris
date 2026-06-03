@@ -913,3 +913,220 @@ fn codex_fallback_hook_example_configures_post_compact_recall() {
         .expect("Polaris post-tool-use hook command exists");
     assert_eq!(post_tool_use_command["type"], "command");
 }
+
+#[test]
+fn traecli_post_compact_hook_emits_additional_context_without_hook_event_name() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "secret", "--text", "secret memory"])
+        .assert()
+        .success();
+
+    let post_compact_input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "post-compact", "--target", "traecli"])
+        .write_stdin(post_compact_input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let hook: Value = serde_json::from_slice(&output).expect("hook json");
+    let context = hook_context(&output);
+    assert!(hook["hookSpecificOutput"].get("hookEventName").is_none());
+    assert!(context.contains("polaris recall"));
+    assert!(!context.contains("secret memory"));
+
+    // TraeCLI path MUST NOT touch the pending state file.
+    assert!(!dir.path().join(".polaris/hook-state.json").exists());
+}
+
+#[test]
+fn traecli_post_compact_hook_is_quiet_without_memory_or_initialization_or_matching_events() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    let post_compact_input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+
+    // Uninitialized workspace -> silent.
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "post-compact", "--target", "traecli"])
+        .write_stdin(post_compact_input.as_str())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    assert!(!dir.path().join(".polaris/hook-state.json").exists());
+
+    // Initialized but no memory -> silent.
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "post-compact", "--target", "traecli"])
+        .write_stdin(post_compact_input.as_str())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    assert!(!dir.path().join(".polaris/hook-state.json").exists());
+
+    // Mismatched event -> silent even with memory.
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "task goal"])
+        .assert()
+        .success();
+    let mismatched_input = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "post-compact", "--target", "traecli"])
+        .write_stdin(mismatched_input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    assert!(!dir.path().join(".polaris/hook-state.json").exists());
+}
+
+#[test]
+fn traecli_session_start_and_post_tool_use_hooks_are_noops() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "task goal"])
+        .assert()
+        .success();
+
+    let session_start_input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "session-start", "--target", "traecli"])
+        .write_stdin(session_start_input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    assert!(!dir.path().join(".polaris/hook-state.json").exists());
+
+    let post_tool_use_input = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "post-tool-use", "--target", "traecli"])
+        .write_stdin(post_tool_use_input)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    assert!(!dir.path().join(".polaris/hook-state.json").exists());
+}
+
+#[test]
+fn hook_rejects_unknown_target_value() {
+    let dir = temp_workspace();
+    let post_compact_input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["hook", "post-compact", "--target", "bogus"])
+        .write_stdin(post_compact_input)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bogus"));
+}
+
+#[test]
+fn hook_default_target_matches_explicit_codex_byte_for_byte() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "task goal"])
+        .assert()
+        .success();
+
+    let compact_input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+
+    let default_output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "session-start"])
+        .write_stdin(compact_input.as_str())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let explicit_output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["hook", "session-start", "--target", "codex"])
+        .write_stdin(compact_input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(default_output, explicit_output);
+}
+
+#[test]
+fn traecli_hook_example_configures_post_compact_recall() {
+    let example_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("traecli-hooks")
+        .join("hooks.json");
+    let example = fs::read_to_string(&example_path).expect("traecli hooks.json exists");
+    let hooks: Value = serde_json::from_str(&example).expect("traecli hooks.json is valid JSON");
+
+    let post_compact_hooks = hooks["hooks"]["PostCompact"]
+        .as_array()
+        .expect("PostCompact hook list exists");
+    let post_compact_command_hooks = post_compact_hooks
+        .first()
+        .and_then(|hook| hook["hooks"].as_array())
+        .expect("PostCompact command hooks exist");
+    let post_compact_command = post_compact_command_hooks
+        .iter()
+        .find(|hook| hook["command"] == "polaris hook post-compact --target traecli")
+        .expect("Polaris TraeCLI post-compact hook command exists");
+    assert_eq!(post_compact_command["type"], "command");
+}

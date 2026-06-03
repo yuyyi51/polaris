@@ -1,4 +1,4 @@
-use crate::hook;
+use crate::hook::{self, HookTarget};
 use crate::storage::{MemoryInput, PolarisStore};
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
@@ -84,11 +84,18 @@ struct HookArgs {
 #[derive(Subcommand)]
 enum HookCommand {
     #[command(name = "session-start")]
-    SessionStart,
+    SessionStart(HookTargetArgs),
     #[command(name = "post-compact")]
-    PostCompact,
+    PostCompact(HookTargetArgs),
     #[command(name = "post-tool-use")]
-    PostToolUse,
+    PostToolUse(HookTargetArgs),
+}
+
+#[derive(Args)]
+struct HookTargetArgs {
+    /// Host adapter that shapes hook stdin/stdout. Defaults to `codex`.
+    #[arg(long, value_enum, default_value_t = HookTarget::default())]
+    target: HookTarget,
 }
 
 pub fn run() -> Result<()> {
@@ -162,27 +169,35 @@ pub fn run() -> Result<()> {
             println!("Cleared Polaris memory");
         }
         Command::Hook(args) => match args.command {
-            HookCommand::SessionStart => {
+            HookCommand::SessionStart(args) => {
                 let mut input = String::new();
                 io::stdin().read_to_string(&mut input)?;
-                if let Some(output) = hook::session_start_output(&input, |cwd: PathBuf| {
-                    PolarisStore::from_workspace(cwd)
-                })? {
-                    println!("{}", serde_json::to_string(&output)?);
+                if let Some(output) =
+                    hook::session_start_output(args.target, &input, |cwd: PathBuf| {
+                        PolarisStore::from_workspace(cwd)
+                    })?
+                {
+                    println!("{}", output.to_json_string()?);
                 }
             }
-            HookCommand::PostCompact => {
+            HookCommand::PostCompact(args) => {
                 let mut input = String::new();
                 io::stdin().read_to_string(&mut input)?;
-                hook::post_compact(&input, |cwd: PathBuf| PolarisStore::from_workspace(cwd))?;
-            }
-            HookCommand::PostToolUse => {
-                let mut input = String::new();
-                io::stdin().read_to_string(&mut input)?;
-                if let Some(output) = hook::post_tool_use_output(&input, |cwd: PathBuf| {
+                if let Some(output) = hook::post_compact(args.target, &input, |cwd: PathBuf| {
                     PolarisStore::from_workspace(cwd)
                 })? {
-                    println!("{}", serde_json::to_string(&output)?);
+                    println!("{}", output.to_json_string()?);
+                }
+            }
+            HookCommand::PostToolUse(args) => {
+                let mut input = String::new();
+                io::stdin().read_to_string(&mut input)?;
+                if let Some(output) =
+                    hook::post_tool_use_output(args.target, &input, |cwd: PathBuf| {
+                        PolarisStore::from_workspace(cwd)
+                    })?
+                {
+                    println!("{}", output.to_json_string()?);
                 }
             }
         },

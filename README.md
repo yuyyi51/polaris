@@ -74,6 +74,34 @@ Recovered Polaris context:
 
 Using `{{recall}}` exposes `polaris recall` output to the agent context. Without that placeholder, a configured prompt is emitted as-is and stored memory is not inlined unless the prompt text itself contains it.
 
+## TraeCLI Integration
+
+Polaris also ships a TraeCLI (Coco) host adapter. Each `polaris hook` subcommand accepts `--target <codex|traecli>`; the default is `codex`, which preserves the existing Codex behavior byte-for-byte. Pass `--target traecli` to switch the stdin/stdout shape to TraeCLI's hook contract: stdout uses `hookSpecificOutput.additionalContext` without the `hookEventName` wrapper.
+
+TraeCLI does not have Codex's `SessionStart`+`compact` matcher; instead, its dedicated `post_compact` event is the recall trigger. Configure only that event with the bundled example at `examples/traecli-hooks/hooks.json`, or adapt this snippet for your TraeCLI hooks file:
+
+```json
+{
+  "hooks": {
+    "PostCompact": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "polaris hook post-compact --target traecli"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`polaris hook session-start --target traecli` and `polaris hook post-tool-use --target traecli` are intentional no-ops, leaving the CLI surface ready for future TraeCLI events.
+
+The same `[hooks].recall_prompt` configuration and safety rules apply: the TraeCLI hook does **not** inline stored memory unless `recall_prompt` explicitly contains the `{{recall}}` placeholder. Without that placeholder, `additionalContext` only instructs the agent to run `polaris recall`.
+
 ## Codex Skill
 
 This repository includes a copyable Codex skill at `skills/codex/polaris/`. To install it into a Codex environment, copy the folder into your skills directory:
