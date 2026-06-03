@@ -102,12 +102,13 @@ TraeCLI does not have Codex's `SessionStart`+`compact` matcher; instead, its ded
 
 The same `[hooks].recall_prompt` configuration and safety rules apply: the TraeCLI hook does **not** inline stored memory unless `recall_prompt` explicitly contains the `{{recall}}` placeholder. Without that placeholder, `additionalContext` only instructs the agent to run `polaris recall`.
 
-## Codex Skill
+## Polaris Skill
 
-This repository includes a copyable Codex skill at `skills/codex/polaris/`. To install it into a Codex environment, copy the folder into your skills directory:
+This repository ships a host-agnostic Polaris skill at `skills/polaris/`. The same `skills/polaris/` folder is copied to any markdown-skill host. To install it, copy the folder into the host's skills directory:
 
 ```bash
-cp -R skills/codex/polaris ~/.codex/skills/
+cp -R skills/polaris ~/.codex/skills/
+cp -R skills/polaris ~/.coco/skills/
 ```
 
 The bundled skill is intentionally minimal. It only requires `SKILL.md`; it does not include or require `agents/openai.yaml`.

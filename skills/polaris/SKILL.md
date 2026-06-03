@@ -1,11 +1,11 @@
 ---
 name: polaris
-description: Use Polaris to preserve and recover important agent context for long-running Codex tasks. Use when starting or resuming substantial multi-step work, when the user mentions Polaris, memory, context preservation, compaction, recall, or when context instructs the agent to run `polaris recall`.
+description: Use Polaris to preserve and recover important agent context for long-running agent tasks. Use when starting or resuming substantial multi-step work, when the user mentions Polaris, memory, context preservation, compaction, recall, or when context instructs the agent to run `polaris recall`.
 ---
 
 # Polaris
 
-Polaris is workspace-local memory for long-running agent work. It stores durable context under `.polaris/` and can remind Codex to reload that context after conversation compaction.
+Polaris is workspace-local memory for long-running agent work. It stores durable context under `.polaris/` and can remind the agent to reload that context after conversation compaction.
 
 ## Recall First
 

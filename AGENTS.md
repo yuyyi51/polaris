@@ -10,7 +10,7 @@ Polaris is a Rust CLI for workspace-local agent memory. It stores durable contex
 - `tests/cli.rs` covers the CLI end to end with temporary workspaces.
 - `openspec/specs/` contains the current accepted specs.
 - `openspec/changes/archive/` contains completed archived changes; do not treat archived changes as active work.
-- `skills/codex/polaris/SKILL.md` is the copyable Codex skill bundled by this repo.
+- `skills/polaris/SKILL.md` is the copyable Polaris skill bundle this repo ships, host-agnostic across markdown-skill hosts.
 
 ## Workflow
 
