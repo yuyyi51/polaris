@@ -1,25 +1,26 @@
-# polaris-codex-skill Specification
+# polaris-skill Specification
 
 ## Purpose
-TBD - created by archiving change add-polaris-codex-skill. Update Purpose after archive.
+TBD - created by archiving change make-skill-host-agnostic. Update Purpose after archive.
 ## Requirements
-### Requirement: Project-bundled Codex skill
-The repository SHALL provide a Codex-compatible Polaris skill under `skills/codex/polaris/`.
+### Requirement: Project-bundled Polaris skill
+The repository SHALL provide a host-agnostic Polaris skill bundle under `skills/polaris/` that any markdown-skill host (Codex, TraeCLI/Coco, or compatible) can install by copying the folder into its skills directory.
 
 #### Scenario: Skill folder is copyable
-- **WHEN** a user copies `skills/codex/polaris/` into a Codex skills directory
-- **THEN** the copied folder contains the files needed for Codex to discover and load the Polaris skill
+- **WHEN** a user copies `skills/polaris/` into a markdown-skill host's skills directory (for example `~/.codex/skills/` or `~/.coco/skills/`)
+- **THEN** the copied folder contains the files needed for that host to discover and load the Polaris skill
 
 #### Scenario: Skill uses minimum required file set
-- **WHEN** the project provides `skills/codex/polaris/`
-- **THEN** the skill folder contains `SKILL.md` and MUST NOT require `agents/openai.yaml`
+- **WHEN** the project provides `skills/polaris/`
+- **THEN** the skill folder contains `SKILL.md` and MUST NOT require any host-specific manifest such as `agents/openai.yaml`
 
 #### Scenario: Skill uses valid frontmatter
-- **WHEN** Codex reads `skills/codex/polaris/SKILL.md`
+- **WHEN** any markdown-skill host reads `skills/polaris/SKILL.md`
 - **THEN** the file contains valid YAML frontmatter with `name` and `description`
+- **AND** neither field references a specific host
 
 ### Requirement: Polaris recovery instruction
-The skill SHALL instruct agents to run `polaris recall` immediately when context tells them to recall Polaris memory.
+The skill SHALL instruct agents to run `polaris recall` immediately when context tells them to recall Polaris memory, regardless of which host produced the recall reminder.
 
 #### Scenario: Recall reminder is present
 - **WHEN** an agent using the skill sees current context instructing it to run `polaris recall`
@@ -27,7 +28,7 @@ The skill SHALL instruct agents to run `polaris recall` immediately when context
 
 #### Scenario: Recovery instruction is source-agnostic
 - **WHEN** the skill describes recall reminder handling
-- **THEN** the skill MUST NOT identify the hook event or hook source that produced the recall reminder
+- **THEN** the skill MUST NOT identify the host, hook event, or hook source that produced the recall reminder
 
 #### Scenario: Recall fails
 - **WHEN** `polaris recall` fails because Polaris is unavailable or not initialized
@@ -72,14 +73,14 @@ The skill SHALL teach agents what keyed information to save in Polaris and which
 - **WHEN** task context includes secrets, tokens, passwords, credentials, or private keys
 - **THEN** the skill directs the agent not to store that information in Polaris
 
-### Requirement: Skill validation
-The project SHALL include validation steps for the bundled Polaris skill.
+### Requirement: Skill documentation
+The README SHALL document the host-agnostic Polaris skill bundle and how to install it on supported hosts.
 
-#### Scenario: Skill implementation is complete
-- **WHEN** the Polaris skill files are created or updated
-- **THEN** the implementation is validated with the skill-creator quick validation script when available
+#### Scenario: README documents the bundle path
+- **WHEN** a user reads the Polaris README skill section
+- **THEN** the README references `skills/polaris/` as the bundle source
 
-#### Scenario: Project checks run
-- **WHEN** the Polaris skill change is completed
-- **THEN** existing project verification commands still pass
-
+#### Scenario: README shows host install paths
+- **WHEN** a user reads the Polaris README skill section
+- **THEN** the README shows install commands for at least Codex (`~/.codex/skills/`) and TraeCLI/Coco (`~/.coco/skills/` or `.coco/skills/`)
+- **AND** the README states that the same `skills/polaris/` folder is copied to any host
