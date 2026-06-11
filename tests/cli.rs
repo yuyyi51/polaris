@@ -3,6 +3,7 @@ use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::process::Command as StdCommand;
 use tempfile::TempDir;
 
 fn polaris() -> Command {
@@ -15,6 +16,45 @@ fn temp_workspace() -> TempDir {
 
 fn init_workspace(dir: &Path) {
     polaris().current_dir(dir).arg("init").assert().success();
+}
+
+fn run_parallel_remember_commands(dir: &Path, commands: Vec<Vec<String>>) {
+    let binary = assert_cmd::cargo::cargo_bin("polaris");
+    let mut children = commands
+        .into_iter()
+        .map(|args| {
+            StdCommand::new(&binary)
+                .current_dir(dir)
+                .args(args)
+                .spawn()
+                .expect("spawn polaris")
+        })
+        .collect::<Vec<_>>();
+
+    for child in children.drain(..) {
+        let output = child.wait_with_output().expect("wait for polaris");
+        assert!(
+            output.status.success(),
+            "polaris command failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn assert_jsonl_records(path: &Path, expected_count: usize) -> Vec<Value> {
+    let memories = fs::read_to_string(path).expect("read memories");
+    let mut records = Vec::new();
+    for (index, line) in memories.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("line {} should be valid JSON: {error}", index + 1));
+        records.push(record);
+    }
+    assert_eq!(records.len(), expected_count);
+    records
 }
 
 fn hook_context(output: &[u8]) -> String {
@@ -234,6 +274,174 @@ fn remember_replace_overwrites_keyed_memory() {
 
     let memories = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
     assert_eq!(memories.matches("\"key\":\"goal\"").count(), 1);
+}
+
+#[test]
+fn concurrent_remember_records_distinct_keys_as_valid_jsonl() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    let commands = (0..64)
+        .map(|index| {
+            vec![
+                "remember".to_string(),
+                "--key".to_string(),
+                format!("k{index}"),
+                "--text".to_string(),
+                format!("memory {index} {}", "x".repeat(512)),
+            ]
+        })
+        .collect();
+    run_parallel_remember_commands(dir.path(), commands);
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 64);
+    for index in 0..64 {
+        assert!(
+            records
+                .iter()
+                .any(|record| record["key"] == format!("k{index}")),
+            "missing key k{index}"
+        );
+    }
+
+    polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("memory 63"));
+    polaris()
+        .current_dir(dir.path())
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"memory_count\": 64"));
+}
+
+#[test]
+fn concurrent_replace_preserves_unrelated_replacements() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    for index in 0..80 {
+        polaris()
+            .current_dir(dir.path())
+            .args([
+                "remember",
+                "--key",
+                &format!("k{index}"),
+                "--text",
+                &format!("initial {index}"),
+            ])
+            .assert()
+            .success();
+    }
+
+    let commands = (0..80)
+        .map(|index| {
+            vec![
+                "remember".to_string(),
+                "--key".to_string(),
+                format!("k{index}"),
+                "--replace".to_string(),
+                "--text".to_string(),
+                format!("replacement {index} {}", "y".repeat(512)),
+            ]
+        })
+        .collect();
+    run_parallel_remember_commands(dir.path(), commands);
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 80);
+    for index in 0..80 {
+        let record = records
+            .iter()
+            .find(|record| record["key"] == format!("k{index}"))
+            .unwrap_or_else(|| panic!("missing key k{index}"));
+        assert!(
+            record["text"]
+                .as_str()
+                .expect("record text")
+                .starts_with(&format!("replacement {index}")),
+            "key k{index} was not replaced: {record:?}"
+        );
+    }
+}
+
+#[test]
+fn remember_separates_append_after_missing_final_newline() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    fs::write(
+        dir.path().join(".polaris/memories.jsonl"),
+        r#"{"id":"first","created_at":"2026-05-31T00:00:00Z","kind":"inline","key":"first","text":"first memory"}"#,
+    )
+    .unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "second", "--text", "second memory"])
+        .assert()
+        .success();
+
+    assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 2);
+    polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("first memory"))
+        .stdout(predicate::str::contains("second memory"));
+}
+
+#[test]
+fn recall_and_status_ignore_blank_memory_lines() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    fs::write(
+        dir.path().join(".polaris/memories.jsonl"),
+        "\n  \n{\"id\":\"first\",\"created_at\":\"2026-05-31T00:00:00Z\",\"kind\":\"inline\",\"key\":\"first\",\"text\":\"first memory\"}\n\n",
+    )
+    .unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("first memory"));
+    polaris()
+        .current_dir(dir.path())
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"memory_count\": 1"));
+}
+
+#[test]
+fn malformed_memory_jsonl_errors_include_path_and_line() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    fs::write(
+        dir.path().join(".polaris/memories.jsonl"),
+        "{\"id\":\"first\",\"created_at\":\"2026-05-31T00:00:00Z\",\"kind\":\"inline\",\"key\":\"first\",\"text\":\"first memory\"}\n{\"id\":\"bad1\",\"created_at\":\"2026-05-31T00:00:00Z\",\"kind\":\"inline\",\"key\":\"bad1\",\"text\":\"bad memory\"}{\"id\":\"bad2\",\"created_at\":\"2026-05-31T00:00:00Z\",\"kind\":\"inline\",\"key\":\"bad2\",\"text\":\"bad memory\"}\n",
+    )
+    .unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(".polaris/memories.jsonl:2"))
+        .stderr(predicate::str::contains("trailing characters"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["status", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(".polaris/memories.jsonl:2"))
+        .stderr(predicate::str::contains("trailing characters"));
 }
 
 #[test]

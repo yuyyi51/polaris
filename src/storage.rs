@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -10,6 +10,7 @@ const POLARIS_DIR: &str = ".polaris";
 const STATE_FILE: &str = "state.json";
 const HOOK_STATE_FILE: &str = "hook-state.json";
 const MEMORIES_FILE: &str = "memories.jsonl";
+const MEMORIES_LOCK_FILE: &str = "memories.lock";
 const DOCS_DIR: &str = "docs";
 
 #[derive(Debug)]
@@ -30,7 +31,7 @@ struct HookState {
     recorded_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemoryRecord {
     pub id: String,
     pub created_at: String,
@@ -45,7 +46,7 @@ pub struct MemoryRecord {
     pub path: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryKind {
     Inline,
@@ -131,6 +132,7 @@ impl PolarisStore {
     }
 
     pub fn remember(&self, input: MemoryInput, replace: bool) -> Result<MemoryRecord> {
+        let _lock = self.lock_memories_exclusive()?;
         let record = MemoryRecord {
             id: new_id(),
             created_at: now(),
@@ -141,7 +143,7 @@ impl PolarisStore {
             path: None,
         };
 
-        let mut records = self.load_records()?;
+        let mut records = self.load_records_unlocked()?;
         let existing = records
             .iter()
             .any(|record| record.is_inline_key(&input.key));
@@ -163,7 +165,8 @@ impl PolarisStore {
     }
 
     pub fn forget(&self, key: &str) -> Result<()> {
-        let mut records = self.load_records()?;
+        let _lock = self.lock_memories_exclusive()?;
+        let mut records = self.load_records_unlocked()?;
         let original_len = records.len();
         records.retain(|record| !record.is_inline_key(key));
         if records.len() == original_len {
@@ -198,6 +201,7 @@ impl PolarisStore {
     }
 
     pub fn create_note(&self, title: &str) -> Result<CreatedNote> {
+        let _lock = self.lock_memories_exclusive()?;
         let id = new_id();
         let file_name = format!("{}-{}.md", id, slugify(title));
         let relative_path = PathBuf::from(POLARIS_DIR).join(DOCS_DIR).join(&file_name);
@@ -256,6 +260,7 @@ impl PolarisStore {
     }
 
     pub fn clear(&self) -> Result<()> {
+        let _lock = self.lock_memories_exclusive()?;
         fs::write(self.memories_file(), "")?;
         let hook_state_file = self.hook_state_file();
         if hook_state_file.exists() {
@@ -320,15 +325,28 @@ impl PolarisStore {
     }
 
     fn load_records(&self) -> Result<Vec<MemoryRecord>> {
-        let file = File::open(self.memories_file())
-            .with_context(|| format!("failed to open {}", self.memories_file().display()))?;
+        let _lock = self.lock_memories_shared()?;
+        self.load_records_unlocked()
+    }
+
+    fn load_records_unlocked(&self) -> Result<Vec<MemoryRecord>> {
+        let memories_file = self.memories_file();
+        let file = File::open(&memories_file)
+            .with_context(|| format!("failed to open {}", memories_file.display()))?;
         let mut records = Vec::new();
-        for line in BufReader::new(file).lines() {
+        for (index, line) in BufReader::new(file).lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            records.push(serde_json::from_str(&line)?);
+            records.push(serde_json::from_str(&line).map_err(|error| {
+                anyhow!(
+                    "failed to parse {}:{}: {}",
+                    memories_file.display(),
+                    index + 1,
+                    error
+                )
+            })?);
         }
         Ok(records)
     }
@@ -336,10 +354,49 @@ impl PolarisStore {
     fn append_record(&self, record: &MemoryRecord) -> Result<()> {
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
-            .open(self.memories_file())?;
-        writeln!(file, "{}", serde_json::to_string(record)?)?;
+            .open(self.memories_file())
+            .with_context(|| format!("failed to open {}", self.memories_file().display()))?;
+
+        let len = file.metadata()?.len();
+        if len > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last_byte = [0; 1];
+            file.read_exact(&mut last_byte)?;
+            if last_byte[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
+
+        let serialized = serde_json::to_string(record)?;
+        file.write_all(serialized.as_bytes())?;
+        file.write_all(b"\n")?;
         Ok(())
+    }
+
+    fn lock_memories_exclusive(&self) -> Result<File> {
+        let file = self.open_memories_lock_file()?;
+        file.lock()
+            .with_context(|| format!("failed to lock {}", self.memories_lock_file().display()))?;
+        Ok(file)
+    }
+
+    fn lock_memories_shared(&self) -> Result<File> {
+        let file = self.open_memories_lock_file()?;
+        file.lock_shared()
+            .with_context(|| format!("failed to lock {}", self.memories_lock_file().display()))?;
+        Ok(file)
+    }
+
+    fn open_memories_lock_file(&self) -> Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(self.memories_lock_file())
+            .with_context(|| format!("failed to open {}", self.memories_lock_file().display()))
     }
 
     fn state_file(&self) -> PathBuf {
@@ -352,6 +409,10 @@ impl PolarisStore {
 
     fn memories_file(&self) -> PathBuf {
         self.root().join(MEMORIES_FILE)
+    }
+
+    fn memories_lock_file(&self) -> PathBuf {
+        self.root().join(MEMORIES_LOCK_FILE)
     }
 
     fn docs_dir(&self) -> PathBuf {
