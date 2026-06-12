@@ -8,18 +8,21 @@ Polaris is a Rust CLI for storing workspace-local agent context under `.polaris/
 polaris init
 polaris status --json
 polaris remember --key goal --text "task goal" --title "Goal"
-polaris remember --key decision --stdin --title "Decision"
+polaris remember --key decision --stdin --title "Decision" --lifecycle durable
+polaris remember --key state.branch --text "working on filters" --lifecycle state
 polaris remember --key goal --replace --text "updated task goal"
 polaris forget goal
 polaris forget goal plan
 polaris forget --prefix decision. --yes
-polaris note create --title "Architecture notes"
+polaris note create --title "Architecture notes" --lifecycle archive
 polaris list --keys
 polaris list --json
+polaris list --json --lifecycle state
 polaris recall
 polaris recall --key goal
 polaris recall --prefix decision.
 polaris recall --exclude state.
+polaris recall --lifecycle durable
 polaris clear --yes
 polaris hook session-start
 polaris hook post-compact
@@ -28,7 +31,18 @@ polaris hook post-tool-use
 
 Inline memories are keyed. Use a short stable key such as `goal`, `plan`, `decision.storage`, `blocker`, or `verification`. Reusing a key fails unless `--replace` is provided, which makes overwrites explicit.
 
-Use `polaris list --keys` for one key per line, or `polaris list --json` for machine-readable record summaries without inline memory text. Use `polaris recall --key <key>`, `polaris recall --prefix <prefix>`, or `polaris recall --exclude <prefix>` to recover only relevant context.
+Memory records may include lifecycle metadata:
+
+- `durable`: stable project knowledge and decisions. This is the default for new and legacy records.
+- `state`: current workspace state that may become stale.
+- `log`: short work logs and handoff breadcrumbs.
+- `archive`: historical context that should stay available but is not normally recalled.
+
+Use `--lifecycle <durable|state|log|archive>` with `polaris remember` or `polaris note create`. Replacing a keyed inline memory preserves its existing lifecycle unless a new `--lifecycle` is provided. Replacement summaries include `updated_at`, `replacement_count`, and `replaced_from`.
+
+Use `polaris list --keys` for one key per line, or `polaris list --json` for machine-readable record summaries without inline memory text. Add `--lifecycle <value>` to `polaris list --json` to inspect one lifecycle. Use `polaris recall --key <key>`, `polaris recall --prefix <prefix>`, `polaris recall --exclude <prefix>`, or `polaris recall --lifecycle <value>` to recover only relevant context. Lifecycle recall composes with exact key, prefix, and exclude-prefix filters.
+
+`polaris status --json` includes lifecycle counts and advisory `stale_volatile_memory` hints for old `state` and `log` records. These hints are machine-readable and do not change command exit status.
 
 Use `polaris forget <key>` or `polaris forget <key>...` to remove selected keyed inline memories. Use `polaris forget --prefix <prefix> --yes` for confirmed prefix cleanup, or `polaris clear --yes` to clear all Polaris memory and note files.
 

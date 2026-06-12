@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, anyhow};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::str::FromStr;
 use uuid::Uuid;
 
 const POLARIS_DIR: &str = ".polaris";
@@ -12,6 +14,7 @@ const HOOK_STATE_FILE: &str = "hook-state.json";
 const MEMORIES_FILE: &str = "memories.jsonl";
 const MEMORIES_LOCK_FILE: &str = "memories.lock";
 const DOCS_DIR: &str = "docs";
+const STALE_VOLATILE_DAYS: i64 = 7;
 
 #[derive(Debug)]
 pub struct PolarisStore {
@@ -35,7 +38,15 @@ struct HookState {
 pub struct MemoryRecord {
     pub id: String,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
     pub kind: MemoryKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<MemoryLifecycle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,10 +64,20 @@ pub enum MemoryKind {
     Note,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryLifecycle {
+    Durable,
+    State,
+    Log,
+    Archive,
+}
+
 pub struct MemoryInput {
     pub key: String,
     pub title: Option<String>,
     pub text: String,
+    pub lifecycle: Option<MemoryLifecycle>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -64,13 +85,21 @@ pub struct MemoryFilter {
     pub key: Option<String>,
     pub prefix: Option<String>,
     pub exclude_prefixes: Vec<String>,
+    pub lifecycle: Option<MemoryLifecycle>,
 }
 
 #[derive(Serialize)]
 pub struct MemorySummary {
     id: String,
     created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
     kind: MemoryKind,
+    lifecycle: MemoryLifecycle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replacement_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replaced_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +119,28 @@ pub struct Status {
     root: String,
     memory_count: usize,
     document_count: usize,
+    lifecycle_counts: BTreeMap<MemoryLifecycle, usize>,
+    stale_volatile_memory: StaleVolatileMemory,
+}
+
+#[derive(Serialize)]
+pub struct StaleVolatileMemory {
+    threshold_days: i64,
+    count: usize,
+    records: Vec<StaleVolatileRecord>,
+}
+
+#[derive(Serialize)]
+pub struct StaleVolatileRecord {
+    id: String,
+    lifecycle: MemoryLifecycle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
 }
 
 impl PolarisStore {
@@ -139,24 +190,38 @@ impl PolarisStore {
 
     pub fn status(&self) -> Result<Status> {
         let initialized = self.is_initialized();
+        let records = if initialized {
+            self.load_records()?
+        } else {
+            Vec::new()
+        };
+        let lifecycle_counts = lifecycle_counts(&records);
+        let stale_volatile_memory = stale_volatile_memory(&records);
         Ok(Status {
             initialized,
             root: self.root().display().to_string(),
-            memory_count: if initialized { self.memory_count()? } else { 0 },
+            memory_count: records.len(),
             document_count: if initialized {
                 self.document_count()?
             } else {
                 0
             },
+            lifecycle_counts,
+            stale_volatile_memory,
         })
     }
 
     pub fn remember(&self, input: MemoryInput, replace: bool) -> Result<MemoryRecord> {
         let _lock = self.lock_memories_exclusive()?;
-        let record = MemoryRecord {
+        let now = now();
+        let mut record = MemoryRecord {
             id: new_id(),
-            created_at: now(),
+            created_at: now.clone(),
+            updated_at: None,
             kind: MemoryKind::Inline,
+            lifecycle: input.lifecycle,
+            replacement_count: None,
+            replaced_from: None,
             key: Some(input.key.clone()),
             title: input.title,
             text: Some(input.text),
@@ -166,14 +231,20 @@ impl PolarisStore {
         let mut records = self.load_records_unlocked()?;
         let existing = records
             .iter()
-            .any(|record| record.is_inline_key(&input.key));
-        if existing {
+            .find(|record| record.is_inline_key(&input.key))
+            .cloned();
+        if let Some(existing) = existing {
             if !replace {
                 return Err(anyhow!(
                     "memory key `{}` already exists; use --replace to overwrite it",
                     input.key
                 ));
             }
+            record.created_at = existing.created_at;
+            record.updated_at = Some(now);
+            record.lifecycle = input.lifecycle.or(existing.lifecycle);
+            record.replacement_count = Some(existing.replacement_count.unwrap_or(0) + 1);
+            record.replaced_from = Some(existing.id);
             records.retain(|record| !record.is_inline_key(&input.key));
             records.push(record);
             self.write_records(&records)?;
@@ -246,7 +317,11 @@ impl PolarisStore {
         Ok(())
     }
 
-    pub fn create_note(&self, title: &str) -> Result<CreatedNote> {
+    pub fn create_note(
+        &self,
+        title: &str,
+        lifecycle: Option<MemoryLifecycle>,
+    ) -> Result<CreatedNote> {
         let _lock = self.lock_memories_exclusive()?;
         let id = new_id();
         let file_name = format!("{}-{}.md", id, slugify(title));
@@ -257,7 +332,11 @@ impl PolarisStore {
         let record = MemoryRecord {
             id: id.clone(),
             created_at: now(),
+            updated_at: None,
             kind: MemoryKind::Note,
+            lifecycle,
+            replacement_count: None,
+            replaced_from: None,
             key: None,
             title: Some(title.to_string()),
             text: None,
@@ -322,10 +401,11 @@ impl PolarisStore {
         Ok(output)
     }
 
-    pub fn list_keys(&self) -> Result<Vec<String>> {
+    pub fn list_keys(&self, filter: &MemoryFilter) -> Result<Vec<String>> {
         Ok(self
             .load_records()?
             .into_iter()
+            .filter(|record| record.matches_filter(filter))
             .filter_map(|record| match record.kind {
                 MemoryKind::Inline => record.key,
                 MemoryKind::Note => None,
@@ -333,10 +413,11 @@ impl PolarisStore {
             .collect())
     }
 
-    pub fn list_summaries(&self) -> Result<Vec<MemorySummary>> {
+    pub fn list_summaries(&self, filter: &MemoryFilter) -> Result<Vec<MemorySummary>> {
         Ok(self
             .load_records()?
             .into_iter()
+            .filter(|record| record.matches_filter(filter))
             .map(MemorySummary::from)
             .collect())
     }
@@ -503,6 +584,10 @@ impl PolarisStore {
 }
 
 impl MemoryRecord {
+    fn effective_lifecycle(&self) -> MemoryLifecycle {
+        self.lifecycle.unwrap_or(MemoryLifecycle::Durable)
+    }
+
     fn is_inline_key(&self, key: &str) -> bool {
         matches!(self.kind, MemoryKind::Inline) && self.key.as_deref() == Some(key)
     }
@@ -520,9 +605,14 @@ impl MemoryRecord {
             return true;
         }
 
-        let key = match self.key.as_deref() {
-            Some(key) => key,
-            None => return filter.key.is_none() && filter.prefix.is_none(),
+        if let Some(lifecycle) = filter.lifecycle
+            && self.effective_lifecycle() != lifecycle
+        {
+            return false;
+        }
+
+        let Some(key) = self.key.as_deref() else {
+            return filter.key.is_none() && filter.prefix.is_none();
         };
 
         if filter
@@ -547,21 +637,114 @@ impl MemoryRecord {
 
 impl MemoryFilter {
     pub fn is_active(&self) -> bool {
-        self.key.is_some() || self.prefix.is_some() || !self.exclude_prefixes.is_empty()
+        self.key.is_some()
+            || self.prefix.is_some()
+            || !self.exclude_prefixes.is_empty()
+            || self.lifecycle.is_some()
     }
 }
 
 impl From<MemoryRecord> for MemorySummary {
     fn from(record: MemoryRecord) -> Self {
+        let lifecycle = record.effective_lifecycle();
         Self {
             id: record.id,
             created_at: record.created_at,
+            updated_at: record.updated_at,
             kind: record.kind,
+            lifecycle,
+            replacement_count: record.replacement_count,
+            replaced_from: record.replaced_from,
             key: record.key,
             title: record.title,
             path: record.path,
         }
     }
+}
+
+impl MemoryLifecycle {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::State => "state",
+            Self::Log => "log",
+            Self::Archive => "archive",
+        }
+    }
+
+    fn all() -> [Self; 4] {
+        [Self::Durable, Self::State, Self::Log, Self::Archive]
+    }
+}
+
+impl std::fmt::Display for MemoryLifecycle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MemoryLifecycle {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "durable" => Ok(Self::Durable),
+            "state" => Ok(Self::State),
+            "log" => Ok(Self::Log),
+            "archive" => Ok(Self::Archive),
+            _ => Err("supported lifecycle values are durable, state, log, and archive".to_string()),
+        }
+    }
+}
+
+fn lifecycle_counts(records: &[MemoryRecord]) -> BTreeMap<MemoryLifecycle, usize> {
+    let mut counts = BTreeMap::new();
+    for lifecycle in MemoryLifecycle::all() {
+        counts.insert(lifecycle, 0);
+    }
+    for record in records {
+        *counts.entry(record.effective_lifecycle()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn stale_volatile_memory(records: &[MemoryRecord]) -> StaleVolatileMemory {
+    let threshold = Utc::now() - Duration::days(STALE_VOLATILE_DAYS);
+    let records = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.effective_lifecycle(),
+                MemoryLifecycle::State | MemoryLifecycle::Log
+            )
+        })
+        .filter(|record| {
+            is_before_threshold(
+                record.updated_at.as_deref().unwrap_or(&record.created_at),
+                threshold,
+            )
+        })
+        .map(|record| StaleVolatileRecord {
+            id: record.id.clone(),
+            lifecycle: record.effective_lifecycle(),
+            key: record.key.clone(),
+            title: record.title.clone(),
+            created_at: record.created_at.clone(),
+            updated_at: record.updated_at.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    StaleVolatileMemory {
+        threshold_days: STALE_VOLATILE_DAYS,
+        count: records.len(),
+        records,
+    }
+}
+
+fn is_before_threshold(timestamp: &str, threshold: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| timestamp.with_timezone(&Utc) < threshold)
+        .unwrap_or(false)
 }
 
 fn new_id() -> String {

@@ -1,5 +1,5 @@
 use crate::hook;
-use crate::storage::{MemoryFilter, MemoryInput, PolarisStore};
+use crate::storage::{MemoryFilter, MemoryInput, MemoryLifecycle, PolarisStore};
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, Read};
@@ -46,6 +46,8 @@ struct RememberArgs {
     title: Option<String>,
     #[arg(long)]
     replace: bool,
+    #[arg(long)]
+    lifecycle: Option<MemoryLifecycle>,
 }
 
 #[derive(Args)]
@@ -64,6 +66,8 @@ struct ListArgs {
     keys: bool,
     #[arg(long)]
     json: bool,
+    #[arg(long)]
+    lifecycle: Option<MemoryLifecycle>,
 }
 
 #[derive(Args)]
@@ -74,6 +78,8 @@ struct RecallArgs {
     prefix: Option<String>,
     #[arg(long = "exclude")]
     exclude_prefixes: Vec<String>,
+    #[arg(long)]
+    lifecycle: Option<MemoryLifecycle>,
 }
 
 #[derive(Args)]
@@ -91,6 +97,8 @@ enum NoteCommand {
 struct NoteCreateArgs {
     #[arg(long)]
     title: String,
+    #[arg(long)]
+    lifecycle: Option<MemoryLifecycle>,
 }
 
 #[derive(Args)]
@@ -151,6 +159,7 @@ pub fn run() -> Result<()> {
                     key,
                     title: args.title,
                     text,
+                    lifecycle: args.lifecycle,
                 },
                 args.replace,
             )?;
@@ -183,14 +192,18 @@ pub fn run() -> Result<()> {
             }
             let store = PolarisStore::from_current_dir()?;
             store.require_initialized()?;
+            let filter = MemoryFilter {
+                lifecycle: args.lifecycle,
+                ..MemoryFilter::default()
+            };
             if args.keys {
-                for key in store.list_keys()? {
+                for key in store.list_keys(&filter)? {
                     println!("{key}");
                 }
             } else {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&store.list_summaries()?)?
+                    serde_json::to_string_pretty(&store.list_summaries(&filter)?)?
                 );
             }
         }
@@ -198,7 +211,7 @@ pub fn run() -> Result<()> {
             NoteCommand::Create(args) => {
                 let store = PolarisStore::from_current_dir()?;
                 store.require_initialized()?;
-                let note = store.create_note(&args.title)?;
+                let note = store.create_note(&args.title, args.lifecycle)?;
                 println!("Created note {}", note.id);
                 println!("Path: {}", note.path.display());
             }
@@ -215,6 +228,7 @@ pub fn run() -> Result<()> {
                     key: args.key,
                     prefix: args.prefix,
                     exclude_prefixes: args.exclude_prefixes,
+                    lifecycle: args.lifecycle,
                 })?
             );
         }

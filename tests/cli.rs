@@ -585,6 +585,323 @@ fn list_outputs_keys_and_json_summaries_without_inline_text() {
 }
 
 #[test]
+fn remember_and_note_create_record_lifecycle_and_reject_invalid_lifecycle() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "branch",
+            "--text",
+            "working on filters",
+            "--lifecycle",
+            "state",
+        ])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "note",
+            "create",
+            "--title",
+            "Release archive",
+            "--lifecycle",
+            "archive",
+        ])
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    let summaries = summaries.as_array().expect("summary array");
+    assert!(
+        summaries
+            .iter()
+            .any(|record| record["key"] == "branch" && record["lifecycle"] == "state")
+    );
+    assert!(summaries.iter().any(|record| {
+        record["title"] == "Release archive" && record["lifecycle"] == "archive"
+    }));
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--text",
+            "task",
+            "--lifecycle",
+            "temporary",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("durable"))
+        .stderr(predicate::str::contains("state"))
+        .stderr(predicate::str::contains("log"))
+        .stderr(predicate::str::contains("archive"));
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 2);
+    assert!(records.iter().all(|record| record["key"] != "goal"));
+}
+
+#[test]
+fn legacy_records_without_lifecycle_load_as_durable() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    fs::write(
+        dir.path().join(".polaris/memories.jsonl"),
+        r#"{"id":"legacy","created_at":"2026-05-31T00:00:00Z","kind":"inline","key":"legacy","text":"old memory"}"#,
+    )
+    .unwrap();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    assert_eq!(summaries[0]["lifecycle"], "durable");
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--lifecycle", "durable"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("old memory"));
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&output).expect("status json");
+    assert_eq!(status["lifecycle_counts"]["durable"], 1);
+}
+
+#[test]
+fn list_and_recall_filter_by_lifecycle_with_existing_filters() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    for (key, text, lifecycle) in [
+        ("decision.current", "current decision", "durable"),
+        ("decision.archived", "archived decision", "archive"),
+        ("state.branch", "branch state", "state"),
+        ("log.today", "today log", "log"),
+    ] {
+        polaris()
+            .current_dir(dir.path())
+            .args([
+                "remember",
+                "--key",
+                key,
+                "--text",
+                text,
+                "--lifecycle",
+                lifecycle,
+            ])
+            .assert()
+            .success();
+    }
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json", "--lifecycle", "state"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    let summaries = summaries.as_array().expect("summary array");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0]["key"], "state.branch");
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--lifecycle", "durable"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("current decision"))
+        .stdout(predicate::str::contains("branch state").not())
+        .stdout(predicate::str::contains("archived decision").not());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--prefix", "decision.", "--lifecycle", "durable"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("current decision"))
+        .stdout(predicate::str::contains("archived decision").not());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "state.branch", "--lifecycle", "state"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("branch state"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--lifecycle", "log", "--exclude", "log."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No matching Polaris memory"));
+}
+
+#[test]
+fn remember_replace_updates_metadata_and_preserves_creation_and_lifecycle() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "branch",
+            "--text",
+            "old branch",
+            "--lifecycle",
+            "state",
+        ])
+        .assert()
+        .success();
+    let initial_records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    let initial_id = initial_records[0]["id"]
+        .as_str()
+        .expect("initial id")
+        .to_string();
+    let created_at = initial_records[0]["created_at"]
+        .as_str()
+        .expect("created_at")
+        .to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "branch",
+            "--replace",
+            "--text",
+            "new branch",
+        ])
+        .assert()
+        .success();
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    let branch = summaries
+        .as_array()
+        .expect("summary array")
+        .iter()
+        .find(|record| record["key"] == "branch")
+        .expect("branch summary");
+    assert_eq!(branch["created_at"], created_at);
+    assert_eq!(branch["lifecycle"], "state");
+    assert_eq!(branch["replacement_count"], 1);
+    assert_eq!(branch["replaced_from"], initial_id);
+    assert!(branch["updated_at"].as_str().expect("updated_at") >= created_at.as_str());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "branch",
+            "--replace",
+            "--text",
+            "archived branch",
+            "--lifecycle",
+            "archive",
+        ])
+        .assert()
+        .success();
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    let branch = &summaries[0];
+    assert_eq!(branch["created_at"], created_at);
+    assert_eq!(branch["lifecycle"], "archive");
+    assert_eq!(branch["replacement_count"], 2);
+}
+
+#[test]
+fn status_json_reports_lifecycle_counts_and_stale_volatile_hints() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    fs::write(
+        dir.path().join(".polaris/memories.jsonl"),
+        concat!(
+            "{\"id\":\"durable\",\"created_at\":\"2026-06-11T00:00:00Z\",\"kind\":\"inline\",\"key\":\"goal\",\"text\":\"goal\",\"lifecycle\":\"durable\"}\n",
+            "{\"id\":\"state\",\"created_at\":\"2026-05-01T00:00:00Z\",\"kind\":\"inline\",\"key\":\"state.branch\",\"text\":\"branch\",\"lifecycle\":\"state\"}\n",
+            "{\"id\":\"log\",\"created_at\":\"2026-05-02T00:00:00Z\",\"kind\":\"inline\",\"key\":\"log.today\",\"text\":\"log\",\"lifecycle\":\"log\"}\n",
+            "{\"id\":\"archive\",\"created_at\":\"2026-06-11T00:00:00Z\",\"kind\":\"inline\",\"key\":\"archive.release\",\"text\":\"archive\",\"lifecycle\":\"archive\"}\n",
+        ),
+    )
+    .unwrap();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&output).expect("status json");
+    assert_eq!(status["lifecycle_counts"]["durable"], 1);
+    assert_eq!(status["lifecycle_counts"]["state"], 1);
+    assert_eq!(status["lifecycle_counts"]["log"], 1);
+    assert_eq!(status["lifecycle_counts"]["archive"], 1);
+    assert_eq!(status["stale_volatile_memory"]["count"], 2);
+    let stale = status["stale_volatile_memory"]["records"]
+        .as_array()
+        .expect("stale records");
+    assert!(
+        stale
+            .iter()
+            .any(|record| record["key"] == "state.branch" && record["lifecycle"] == "state")
+    );
+    assert!(
+        stale
+            .iter()
+            .any(|record| record["key"] == "log.today" && record["lifecycle"] == "log")
+    );
+}
+
+#[test]
 fn recall_filters_by_key_prefix_and_excluded_prefix() {
     let dir = temp_workspace();
     init_workspace(dir.path());

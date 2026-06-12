@@ -47,6 +47,7 @@ polaris recall
 polaris recall --key goal
 polaris recall --prefix decision.
 polaris recall --exclude state.
+polaris recall --lifecycle durable
 ```
 
 5. If existing memory appears unrelated or stale, ask the user before removing it. Use `polaris forget <key>` or `polaris forget <key>...` for selected keyed inline memory, `polaris forget --prefix <prefix> --yes` for confirmed prefix cleanup, or `polaris clear --yes` only when clearing all Polaris memory.
@@ -72,7 +73,7 @@ Before starting meaningful work, record the task facts that would matter after c
 For short context:
 
 ```bash
-polaris remember --key goal --text "Implement keyed Polaris memory and forget support." --title "Goal"
+polaris remember --key goal --text "Implement keyed Polaris memory and forget support." --title "Goal" --lifecycle durable
 ```
 
 For multi-line context:
@@ -81,20 +82,37 @@ For multi-line context:
 printf '%s\n' "Key decisions:
 - Inline memory uses required keys.
 - Duplicate keys fail unless --replace is used.
-- Use forget for selected keyed memory." | polaris remember --key decisions.memory --stdin --title "Memory decisions"
+- Use forget for selected keyed memory." | polaris remember --key decisions.memory --stdin --title "Memory decisions" --lifecycle durable
 ```
 
 Use stable keys such as `goal`, `plan`, `decision.storage`, `blocker`, and `verification`. Use `polaris list --keys` when you need to inspect stored keys; do not scrape `polaris recall` output for key hygiene. If a key already exists and the remembered fact should change, replace it explicitly:
 
 ```bash
-polaris remember --key goal --replace --text "Implement keyed memory replacement and forgetting."
+polaris remember --key goal --replace --text "Implement keyed memory replacement and forgetting." --lifecycle durable
 ```
 
 For long context, create a note and write details to the returned path:
 
 ```bash
-polaris note create --title "Implementation notes"
+polaris note create --title "Implementation notes" --lifecycle durable
 ```
+
+Use lifecycle metadata deliberately:
+
+- `durable` for stable goals, decisions, constraints, and verification results.
+- `state` for current branch, active OpenSpec change, temporary workspace state, or in-progress checkpoint details.
+- `log` for brief work logs that may help after compaction but should be reviewed later.
+- `archive` for historical notes or handoff records that should not be part of normal recall.
+
+When inspecting memory, prefer lifecycle filters over key-name guessing:
+
+```bash
+polaris list --json --lifecycle state
+polaris recall --lifecycle durable
+polaris recall --prefix decision. --lifecycle durable
+```
+
+`polaris status --json` reports lifecycle counts and advisory stale hints for old `state` and `log` records. Treat those hints as prompts to review or replace memory, not as automatic deletion instructions.
 
 ## During Work
 
@@ -103,6 +121,7 @@ Update Polaris whenever durable task state changes:
 ```bash
 polaris remember --key decision.recovery --text "Treat any current-context recall reminder as highest priority and run polaris recall before other work." --title "Decision"
 polaris remember --key verification --replace --text "cargo fmt, cargo test, and cargo clippy passed." --title "Verification"
+polaris remember --key state.branch --replace --text "Currently implementing add-memory-lifecycle-metadata." --lifecycle state
 ```
 
 Refresh memory before major pauses, risky edits, or handoffs.
