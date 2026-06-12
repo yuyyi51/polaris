@@ -521,6 +521,265 @@ fn forget_rejects_unknown_key_and_missing_workspace() {
 }
 
 #[test]
+fn list_outputs_keys_and_json_summaries_without_inline_text() {
+    let dir = temp_workspace();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["list", "--keys"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("polaris init"));
+
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--text",
+            "private goal text",
+            "--title",
+            "Goal",
+        ])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "plan", "--text", "private plan text"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["note", "create", "--title", "Architecture notes"])
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["list", "--keys"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("goal\nplan\n"));
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    let summaries = summaries.as_array().expect("summary array");
+    assert_eq!(summaries.len(), 3);
+    assert!(summaries.iter().any(|record| record["key"] == "goal"));
+    assert!(summaries.iter().any(|record| record["key"] == "plan"));
+    assert!(
+        summaries
+            .iter()
+            .any(|record| record["kind"] == "note" && record["title"] == "Architecture notes")
+    );
+    assert!(summaries.iter().all(|record| record.get("text").is_none()));
+}
+
+#[test]
+fn recall_filters_by_key_prefix_and_excluded_prefix() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    for (key, text) in [
+        ("goal", "goal memory"),
+        ("decision.current", "current decision"),
+        ("decision.old.storage", "old decision"),
+        ("state.branch", "state memory"),
+    ] {
+        polaris()
+            .current_dir(dir.path())
+            .args(["remember", "--key", key, "--text", text])
+            .assert()
+            .success();
+    }
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "goal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("goal memory"))
+        .stdout(predicate::str::contains("current decision").not());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--prefix", "decision."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("current decision"))
+        .stdout(predicate::str::contains("old decision"))
+        .stdout(predicate::str::contains("goal memory").not());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--exclude", "state."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("goal memory"))
+        .stdout(predicate::str::contains("state memory").not());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "recall",
+            "--prefix",
+            "decision.",
+            "--exclude",
+            "decision.old.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("current decision"))
+        .stdout(predicate::str::contains("old decision").not());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "goal", "--prefix", "decision."])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "missing"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No matching Polaris memory"));
+}
+
+#[test]
+fn forget_removes_multiple_keys_atomically() {
+    let dir = temp_workspace();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "goal", "plan"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("polaris init"));
+
+    init_workspace(dir.path());
+    for (key, text) in [
+        ("goal", "goal memory"),
+        ("plan", "plan memory"),
+        ("decision", "decision memory"),
+    ] {
+        polaris()
+            .current_dir(dir.path())
+            .args(["remember", "--key", key, "--text", text])
+            .assert()
+            .success();
+    }
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "goal", "missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No memory exists for key `missing`",
+        ));
+
+    polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("goal memory"))
+        .stdout(predicate::str::contains("plan memory"))
+        .stdout(predicate::str::contains("decision memory"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "goal", "plan"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Forgot 2 memories"));
+
+    polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("goal memory").not())
+        .stdout(predicate::str::contains("plan memory").not())
+        .stdout(predicate::str::contains("decision memory"));
+}
+
+#[test]
+fn forget_prefix_requires_confirmation_and_preserves_unmatched_records() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    for (key, text) in [
+        ("decision.storage", "storage decision"),
+        ("decision.hooks", "hook decision"),
+        ("goal", "goal memory"),
+    ] {
+        polaris()
+            .current_dir(dir.path())
+            .args(["remember", "--key", key, "--text", text])
+            .assert()
+            .success();
+    }
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "--prefix", "decision."])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--yes"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "--prefix", "", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("prefix must not be empty"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "--prefix", "missing.", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No memory exists for prefix `missing.`",
+        ));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "goal", "--prefix", "decision.", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["forget", "--prefix", "decision.", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Forgot 2 memories"));
+
+    polaris()
+        .current_dir(dir.path())
+        .arg("recall")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("storage decision").not())
+        .stdout(predicate::str::contains("hook decision").not())
+        .stdout(predicate::str::contains("goal memory"));
+}
+
+#[test]
 fn recall_preserves_legacy_unkeyed_inline_memory() {
     let dir = temp_workspace();
     init_workspace(dir.path());

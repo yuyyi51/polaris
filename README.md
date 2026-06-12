@@ -11,15 +11,26 @@ polaris remember --key goal --text "task goal" --title "Goal"
 polaris remember --key decision --stdin --title "Decision"
 polaris remember --key goal --replace --text "updated task goal"
 polaris forget goal
+polaris forget goal plan
+polaris forget --prefix decision. --yes
 polaris note create --title "Architecture notes"
+polaris list --keys
+polaris list --json
 polaris recall
+polaris recall --key goal
+polaris recall --prefix decision.
+polaris recall --exclude state.
 polaris clear --yes
 polaris hook session-start
 polaris hook post-compact
 polaris hook post-tool-use
 ```
 
-Inline memories are keyed. Use a short stable key such as `goal`, `plan`, `decision.storage`, `blocker`, or `verification`. Reusing a key fails unless `--replace` is provided, which makes overwrites explicit. Use `polaris forget <key>` to remove one keyed inline memory, or `polaris clear --yes` to clear all Polaris memory and note files.
+Inline memories are keyed. Use a short stable key such as `goal`, `plan`, `decision.storage`, `blocker`, or `verification`. Reusing a key fails unless `--replace` is provided, which makes overwrites explicit.
+
+Use `polaris list --keys` for one key per line, or `polaris list --json` for machine-readable record summaries without inline memory text. Use `polaris recall --key <key>`, `polaris recall --prefix <prefix>`, or `polaris recall --exclude <prefix>` to recover only relevant context.
+
+Use `polaris forget <key>` or `polaris forget <key>...` to remove selected keyed inline memories. Use `polaris forget --prefix <prefix> --yes` for confirmed prefix cleanup, or `polaris clear --yes` to clear all Polaris memory and note files.
 
 ## Codex Hook
 

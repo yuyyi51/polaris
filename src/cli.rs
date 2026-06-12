@@ -1,5 +1,5 @@
 use crate::hook;
-use crate::storage::{MemoryInput, PolarisStore};
+use crate::storage::{MemoryFilter, MemoryInput, PolarisStore};
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, Read};
@@ -21,8 +21,9 @@ enum Command {
     Status(StatusArgs),
     Remember(RememberArgs),
     Forget(ForgetArgs),
+    List(ListArgs),
     Note(NoteArgs),
-    Recall,
+    Recall(RecallArgs),
     Clear(ClearArgs),
     Hook(HookArgs),
 }
@@ -49,7 +50,30 @@ struct RememberArgs {
 
 #[derive(Args)]
 struct ForgetArgs {
-    key: String,
+    #[arg(value_name = "KEY")]
+    keys: Vec<String>,
+    #[arg(long)]
+    prefix: Option<String>,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct ListArgs {
+    #[arg(long)]
+    keys: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct RecallArgs {
+    #[arg(long)]
+    key: Option<String>,
+    #[arg(long)]
+    prefix: Option<String>,
+    #[arg(long = "exclude")]
+    exclude_prefixes: Vec<String>,
 }
 
 #[derive(Args)]
@@ -135,8 +159,40 @@ pub fn run() -> Result<()> {
         Command::Forget(args) => {
             let store = PolarisStore::from_current_dir()?;
             store.require_initialized()?;
-            store.forget(&args.key)?;
-            println!("Forgot memory {}", args.key);
+            if args.prefix.is_some() && !args.keys.is_empty() {
+                return Err(anyhow!("positional keys cannot be used with --prefix"));
+            }
+            if let Some(prefix) = args.prefix {
+                if !args.yes {
+                    return Err(anyhow!("refusing to forget memory by prefix without --yes"));
+                }
+                let removed = store.forget_prefix(&prefix)?;
+                println!("Forgot {removed} memories with prefix {prefix}");
+            } else {
+                let removed = store.forget_keys(&args.keys)?;
+                if removed == 1 {
+                    println!("Forgot memory {}", args.keys[0]);
+                } else {
+                    println!("Forgot {removed} memories");
+                }
+            }
+        }
+        Command::List(args) => {
+            if args.keys == args.json {
+                return Err(anyhow!("list requires exactly one of --keys or --json"));
+            }
+            let store = PolarisStore::from_current_dir()?;
+            store.require_initialized()?;
+            if args.keys {
+                for key in store.list_keys()? {
+                    println!("{key}");
+                }
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&store.list_summaries()?)?
+                );
+            }
         }
         Command::Note(args) => match args.command {
             NoteCommand::Create(args) => {
@@ -147,10 +203,20 @@ pub fn run() -> Result<()> {
                 println!("Path: {}", note.path.display());
             }
         },
-        Command::Recall => {
+        Command::Recall(args) => {
+            if args.key.is_some() && args.prefix.is_some() {
+                return Err(anyhow!("recall --key cannot be used with --prefix"));
+            }
             let store = PolarisStore::from_current_dir()?;
             store.require_initialized()?;
-            print!("{}", store.recall()?);
+            print!(
+                "{}",
+                store.recall_filtered(&MemoryFilter {
+                    key: args.key,
+                    prefix: args.prefix,
+                    exclude_prefixes: args.exclude_prefixes,
+                })?
+            );
         }
         Command::Clear(args) => {
             if !args.yes {

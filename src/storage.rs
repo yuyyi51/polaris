@@ -59,6 +59,26 @@ pub struct MemoryInput {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct MemoryFilter {
+    pub key: Option<String>,
+    pub prefix: Option<String>,
+    pub exclude_prefixes: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct MemorySummary {
+    id: String,
+    created_at: String,
+    kind: MemoryKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
 pub struct CreatedNote {
     pub id: String,
     pub path: PathBuf,
@@ -164,15 +184,41 @@ impl PolarisStore {
         }
     }
 
-    pub fn forget(&self, key: &str) -> Result<()> {
+    pub fn forget_keys(&self, keys: &[String]) -> Result<usize> {
+        if keys.is_empty() {
+            return Err(anyhow!("forget requires at least one key or --prefix"));
+        }
+
+        let _lock = self.lock_memories_exclusive()?;
+        let mut records = self.load_records_unlocked()?;
+        for key in keys {
+            if !records.iter().any(|record| record.is_inline_key(key)) {
+                return Err(anyhow!("No memory exists for key `{key}`"));
+            }
+        }
+
+        let original_len = records.len();
+        records.retain(|record| !keys.iter().any(|key| record.is_inline_key(key.as_str())));
+        let removed = original_len - records.len();
+        self.write_records(&records)?;
+        Ok(removed)
+    }
+
+    pub fn forget_prefix(&self, prefix: &str) -> Result<usize> {
+        if prefix.is_empty() {
+            return Err(anyhow!("prefix must not be empty"));
+        }
+
         let _lock = self.lock_memories_exclusive()?;
         let mut records = self.load_records_unlocked()?;
         let original_len = records.len();
-        records.retain(|record| !record.is_inline_key(key));
-        if records.len() == original_len {
-            return Err(anyhow!("No memory exists for key `{key}`"));
+        records.retain(|record| !record.is_inline_key_prefix(prefix));
+        let removed = original_len - records.len();
+        if removed == 0 {
+            return Err(anyhow!("No memory exists for prefix `{prefix}`"));
         }
-        self.write_records(&records)
+        self.write_records(&records)?;
+        Ok(removed)
     }
 
     fn write_records(&self, records: &[MemoryRecord]) -> Result<()> {
@@ -226,7 +272,24 @@ impl PolarisStore {
     }
 
     pub fn recall(&self) -> Result<String> {
+        self.recall_filtered(&MemoryFilter::default())
+    }
+
+    pub fn recall_filtered(&self, filter: &MemoryFilter) -> Result<String> {
         let records = self.load_records()?;
+        let filtered = records
+            .into_iter()
+            .filter(|record| record.matches_filter(filter))
+            .collect::<Vec<_>>();
+
+        if filter.is_active() && filtered.is_empty() {
+            return Ok("No matching Polaris memory is stored for this workspace.\n".to_string());
+        }
+
+        Self::render_recall(filtered)
+    }
+
+    fn render_recall(records: Vec<MemoryRecord>) -> Result<String> {
         if records.is_empty() {
             return Ok("No Polaris memory is stored for this workspace.\n".to_string());
         }
@@ -257,6 +320,25 @@ impl PolarisStore {
             }
         }
         Ok(output)
+    }
+
+    pub fn list_keys(&self) -> Result<Vec<String>> {
+        Ok(self
+            .load_records()?
+            .into_iter()
+            .filter_map(|record| match record.kind {
+                MemoryKind::Inline => record.key,
+                MemoryKind::Note => None,
+            })
+            .collect())
+    }
+
+    pub fn list_summaries(&self) -> Result<Vec<MemorySummary>> {
+        Ok(self
+            .load_records()?
+            .into_iter()
+            .map(MemorySummary::from)
+            .collect())
     }
 
     pub fn clear(&self) -> Result<()> {
@@ -423,6 +505,62 @@ impl PolarisStore {
 impl MemoryRecord {
     fn is_inline_key(&self, key: &str) -> bool {
         matches!(self.kind, MemoryKind::Inline) && self.key.as_deref() == Some(key)
+    }
+
+    fn is_inline_key_prefix(&self, prefix: &str) -> bool {
+        matches!(self.kind, MemoryKind::Inline)
+            && self
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(prefix))
+    }
+
+    fn matches_filter(&self, filter: &MemoryFilter) -> bool {
+        if !filter.is_active() {
+            return true;
+        }
+
+        let key = match self.key.as_deref() {
+            Some(key) => key,
+            None => return filter.key.is_none() && filter.prefix.is_none(),
+        };
+
+        if filter
+            .exclude_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return false;
+        }
+
+        if let Some(exact) = filter.key.as_deref() {
+            return key == exact;
+        }
+
+        if let Some(prefix) = filter.prefix.as_deref() {
+            return key.starts_with(prefix);
+        }
+
+        true
+    }
+}
+
+impl MemoryFilter {
+    pub fn is_active(&self) -> bool {
+        self.key.is_some() || self.prefix.is_some() || !self.exclude_prefixes.is_empty()
+    }
+}
+
+impl From<MemoryRecord> for MemorySummary {
+    fn from(record: MemoryRecord) -> Self {
+        Self {
+            id: record.id,
+            created_at: record.created_at,
+            kind: record.kind,
+            key: record.key,
+            title: record.title,
+            path: record.path,
+        }
     }
 }
 
