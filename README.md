@@ -64,7 +64,56 @@ polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes
 
 Add `--forget-sources` to remove the source keyed inline memories in the same confirmed apply operation. Invalid drafts and unconfirmed apply commands leave active memory unchanged.
 
-Use `polaris prune --suggest` and `polaris compact --suggest` to inspect deterministic maintenance suggestions without mutating memory. Add `--json` for machine-readable suggestions. Prune suggestions flag old volatile records, duplicate exact text, and replacement metadata. Compact suggestions flag shared key prefixes and related lifecycle groups.
+Use `polaris prune --suggest` and `polaris compact --suggest` to inspect deterministic maintenance suggestions without mutating memory. Prune suggestions flag old volatile records, duplicate exact text, and replacement metadata. Compact suggestions flag shared key prefixes and related lifecycle groups. Both commands include an agent review prompt by default so the caller can inspect candidates before taking action.
+
+With `--json`, suggest commands return an envelope:
+
+```json
+{
+  "suggestions": [],
+  "prompt": "...",
+  "prompt_context": {
+    "status": {},
+    "keys": []
+  }
+}
+```
+
+Customize maintenance prompts in `.polaris/config.toml` or `~/.polaris/config.toml`. Copyable examples are available under `examples/polaris-config/`:
+
+- `minimal-maintenance-prompts.toml`: minimal prune and compact prompt templates
+- `conservative-prune.toml`: stricter deletion review prompt
+- `merge-focused-compact.toml`: merge-oriented compact review prompt
+- `full-config.toml`: hook prompt plus maintenance prompts
+
+A minimal maintenance prompt config looks like this:
+
+```toml
+[maintenance.prompts]
+prune = """
+Review these prune candidates before deleting anything:
+{{suggestions}}
+
+Status:
+{{status}}
+
+Keys:
+{{keys}}
+"""
+
+compact = """
+Review these compact candidates before merging anything:
+{{suggestions}}
+
+Status:
+{{status}}
+
+Keys:
+{{keys}}
+"""
+```
+
+Supported maintenance prompt placeholders are `{{suggestions}}`, `{{status}}`, and `{{keys}}`. Maintenance prompts do not support `{{recall}}`; use targeted `polaris recall --key <key>` or `polaris recall --prefix <prefix>` after reviewing the generated prompt.
 
 ## Codex Hook
 

@@ -262,14 +262,15 @@ pub fn run() -> Result<()> {
             }
             let store = PolarisStore::from_current_dir()?;
             store.require_initialized()?;
-            let suggestions = store.prune_suggestions()?;
+            let response = store.prune_suggestion_response()?;
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&suggestions)?);
-            } else if suggestions.is_empty() {
-                println!("No prune suggestions are available.");
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else if response.suggestions.is_empty() {
+                println!("No prune suggestions are available.\n");
+                println!("Agent prompt:\n{}", response.prompt);
             } else {
                 println!("Prune suggestions:");
-                for suggestion in suggestions {
+                for suggestion in response.suggestions {
                     println!("- {}", suggestion.candidate_keys.join(", "));
                     for reason in suggestion.reasons {
                         println!("  Reason: {reason}");
@@ -278,6 +279,7 @@ pub fn run() -> Result<()> {
                         println!("  Command: {command}");
                     }
                 }
+                println!("\nAgent prompt:\n{}", response.prompt);
             }
         }
         Command::Compact(args) => {
@@ -286,14 +288,15 @@ pub fn run() -> Result<()> {
             }
             let store = PolarisStore::from_current_dir()?;
             store.require_initialized()?;
-            let suggestions = store.compact_suggestions()?;
+            let response = store.compact_suggestion_response()?;
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&suggestions)?);
-            } else if suggestions.is_empty() {
-                println!("No compact suggestions are available.");
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else if response.suggestions.is_empty() {
+                println!("No compact suggestions are available.\n");
+                println!("Agent prompt:\n{}", response.prompt);
             } else {
                 println!("Compact suggestions:");
-                for suggestion in suggestions {
+                for suggestion in response.suggestions {
                     println!(
                         "- {} -> {}",
                         suggestion.source_keys.join(", "),
@@ -304,6 +307,7 @@ pub fn run() -> Result<()> {
                     }
                     println!("  Command: {}", suggestion.suggested_command);
                 }
+                println!("\nAgent prompt:\n{}", response.prompt);
             }
         }
         Command::List(args) => {

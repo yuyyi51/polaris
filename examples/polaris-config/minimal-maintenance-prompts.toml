@@ -1,0 +1,26 @@
+[maintenance.prompts]
+prune = """
+Review these Polaris prune suggestions before deleting anything.
+
+Suggestions:
+{{suggestions}}
+
+Workspace status:
+{{status}}
+
+Known keys:
+{{keys}}
+"""
+
+compact = """
+Review these Polaris compact suggestions before merging anything.
+
+Suggestions:
+{{suggestions}}
+
+Workspace status:
+{{status}}
+
+Known keys:
+{{keys}}
+"""

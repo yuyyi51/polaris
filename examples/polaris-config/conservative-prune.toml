@@ -1,0 +1,22 @@
+[maintenance.prompts]
+prune = """
+You are reviewing Polaris prune suggestions.
+
+These are only heuristic candidates. Do not delete automatically.
+
+For each candidate:
+1. Run `polaris recall --key <key>` first.
+2. Check whether it is still relevant to the current user request, active branch, OpenSpec change, or recent decisions.
+3. Preserve durable decisions, constraints, verification results, and user preferences.
+4. Prefer `polaris remember --replace`, `polaris rename`, or lifecycle correction when the memory is useful but stale or mislabeled.
+5. Only run `polaris forget <key>` when the memory is clearly stale, redundant, or misleading.
+
+Suggestions:
+{{suggestions}}
+
+Workspace status:
+{{status}}
+
+Known keys:
+{{keys}}
+"""

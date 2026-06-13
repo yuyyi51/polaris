@@ -11,11 +11,54 @@ use uuid::Uuid;
 const POLARIS_DIR: &str = ".polaris";
 const STATE_FILE: &str = "state.json";
 const HOOK_STATE_FILE: &str = "hook-state.json";
+const CONFIG_FILE: &str = "config.toml";
 const MEMORIES_FILE: &str = "memories.jsonl";
 const MEMORIES_LOCK_FILE: &str = "memories.lock";
 const DOCS_DIR: &str = "docs";
 const MAINTENANCE_DIR: &str = "maintenance";
 const STALE_VOLATILE_DAYS: i64 = 7;
+const SUGGESTIONS_PLACEHOLDER: &str = "{{suggestions}}";
+const STATUS_PLACEHOLDER: &str = "{{status}}";
+const KEYS_PLACEHOLDER: &str = "{{keys}}";
+const DEFAULT_PRUNE_PROMPT: &str = r#"You are reviewing Polaris prune suggestions.
+
+These suggestions are heuristic candidates, not deletion decisions.
+Before removing any memory:
+1. Inspect each candidate with `polaris recall --key <key>`.
+2. Check whether the memory is still relevant to the current task, active branch, OpenSpec work, or recent user intent.
+3. Preserve durable decisions, constraints, and verification results unless they are clearly superseded.
+4. Treat old `state` and `log` records as review candidates, not automatic deletion targets.
+5. Prefer `polaris rename`, `polaris remember --replace`, or lifecycle changes when the memory is useful but mislabeled.
+6. Only run `polaris forget <key>` when the memory is clearly stale, redundant, or misleading.
+
+Workspace status:
+{{status}}
+
+Known keys:
+{{keys}}
+
+Prune suggestions:
+{{suggestions}}"#;
+const DEFAULT_COMPACT_PROMPT: &str = r#"You are reviewing Polaris compact suggestions.
+
+These suggestions are heuristic consolidation candidates, not merge decisions.
+Before merging any memory:
+1. Recall every source key with `polaris recall --key <key>` or use a narrow prefix recall.
+2. Decide whether the source memories describe one coherent durable fact, decision, state summary, or handoff note.
+3. Do not merge unrelated records just because they share a prefix or lifecycle.
+4. If merging is appropriate, run `polaris merge --into <target> <source>...` to create a draft.
+5. Edit the draft so the merged memory is concise, accurate, and preserves important constraints.
+6. Apply with `polaris merge apply <draft> --yes`.
+7. Use `--forget-sources` only when the merged target fully supersedes every source key.
+
+Workspace status:
+{{status}}
+
+Known keys:
+{{keys}}
+
+Compact suggestions:
+{{suggestions}}"#;
 
 #[derive(Debug)]
 pub struct PolarisStore {
@@ -125,6 +168,22 @@ struct MergeDraft {
     text: String,
 }
 
+#[derive(Deserialize)]
+struct PolarisConfig {
+    maintenance: Option<MaintenanceConfig>,
+}
+
+#[derive(Deserialize)]
+struct MaintenanceConfig {
+    prompts: Option<MaintenancePromptsConfig>,
+}
+
+#[derive(Default, Deserialize)]
+struct MaintenancePromptsConfig {
+    prune: Option<String>,
+    compact: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct Status {
     initialized: bool,
@@ -168,6 +227,24 @@ pub struct CompactSuggestion {
     pub proposed_target_key: String,
     pub reasons: Vec<String>,
     pub suggested_command: String,
+}
+
+#[derive(Serialize)]
+pub struct SuggestionResponse<T> {
+    pub suggestions: Vec<T>,
+    pub prompt: String,
+    pub prompt_context: SuggestionPromptContext,
+}
+
+#[derive(Serialize)]
+pub struct SuggestionPromptContext {
+    status: Status,
+    keys: Vec<String>,
+}
+
+enum MaintenancePromptKind {
+    Prune,
+    Compact,
 }
 
 impl PolarisStore {
@@ -582,6 +659,75 @@ impl PolarisStore {
     pub fn compact_suggestions(&self) -> Result<Vec<CompactSuggestion>> {
         let records = self.load_records()?;
         Ok(compact_suggestions(&records))
+    }
+
+    pub fn prune_suggestion_response(&self) -> Result<SuggestionResponse<PruneSuggestion>> {
+        let suggestions = self.prune_suggestions()?;
+        self.suggestion_response(suggestions, MaintenancePromptKind::Prune)
+    }
+
+    pub fn compact_suggestion_response(&self) -> Result<SuggestionResponse<CompactSuggestion>> {
+        let suggestions = self.compact_suggestions()?;
+        self.suggestion_response(suggestions, MaintenancePromptKind::Compact)
+    }
+
+    fn suggestion_response<T: Serialize>(
+        &self,
+        suggestions: Vec<T>,
+        kind: MaintenancePromptKind,
+    ) -> Result<SuggestionResponse<T>> {
+        let status = self.status()?;
+        let keys = self.list_keys(&MemoryFilter::default())?;
+        let prompt = self.render_maintenance_prompt(&kind, &suggestions, &status, &keys)?;
+
+        Ok(SuggestionResponse {
+            suggestions,
+            prompt,
+            prompt_context: SuggestionPromptContext { status, keys },
+        })
+    }
+
+    fn render_maintenance_prompt<T: Serialize>(
+        &self,
+        kind: &MaintenancePromptKind,
+        suggestions: &[T],
+        status: &Status,
+        keys: &[String],
+    ) -> Result<String> {
+        let prompts = self.configured_maintenance_prompts()?;
+        let template = match kind {
+            MaintenancePromptKind::Prune => {
+                prompts.prune.as_deref().unwrap_or(DEFAULT_PRUNE_PROMPT)
+            }
+            MaintenancePromptKind::Compact => {
+                prompts.compact.as_deref().unwrap_or(DEFAULT_COMPACT_PROMPT)
+            }
+        };
+
+        Ok(template
+            .replace(
+                SUGGESTIONS_PLACEHOLDER,
+                &serde_json::to_string_pretty(suggestions)?,
+            )
+            .replace(STATUS_PLACEHOLDER, &serde_json::to_string_pretty(status)?)
+            .replace(KEYS_PLACEHOLDER, &serde_json::to_string_pretty(keys)?))
+    }
+
+    fn configured_maintenance_prompts(&self) -> Result<MaintenancePromptsConfig> {
+        let workspace_config = self.root().join(CONFIG_FILE);
+        if config_exists(&workspace_config)? {
+            return read_maintenance_prompts(&workspace_config);
+        }
+
+        let Some(home) = std::env::var_os("HOME") else {
+            return Ok(MaintenancePromptsConfig::default());
+        };
+        let user_config = PathBuf::from(home).join(POLARIS_DIR).join(CONFIG_FILE);
+        if config_exists(&user_config)? {
+            return read_maintenance_prompts(&user_config);
+        }
+
+        Ok(MaintenancePromptsConfig::default())
     }
 
     pub fn clear(&self) -> Result<()> {
@@ -1018,6 +1164,22 @@ fn keyed_inline_records(records: &[MemoryRecord]) -> impl Iterator<Item = &Memor
     records
         .iter()
         .filter(|record| matches!(record.kind, MemoryKind::Inline) && record.key.is_some())
+}
+
+fn config_exists(path: &Path) -> Result<bool> {
+    path.try_exists()
+        .with_context(|| format!("failed to inspect Polaris config {}", path.display()))
+}
+
+fn read_maintenance_prompts(path: &Path) -> Result<MaintenancePromptsConfig> {
+    let config = fs::read_to_string(path)
+        .with_context(|| format!("failed to read Polaris config {}", path.display()))?;
+    let config: PolarisConfig = toml::from_str(&config)
+        .with_context(|| format!("failed to parse Polaris config {}", path.display()))?;
+    Ok(config
+        .maintenance
+        .and_then(|maintenance| maintenance.prompts)
+        .unwrap_or_default())
 }
 
 fn is_before_threshold(timestamp: &str, threshold: DateTime<Utc>) -> bool {

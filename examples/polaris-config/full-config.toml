@@ -1,0 +1,41 @@
+[hooks]
+recall_prompt = "Polaris has saved context. Run `polaris recall` before continuing."
+
+[maintenance.prompts]
+prune = """
+Review prune candidates conservatively.
+
+Before deleting:
+1. Inspect each candidate with `polaris recall --key <key>`.
+2. Preserve durable decisions, constraints, and verification results.
+3. Prefer replacement, rename, or lifecycle correction when the memory is still useful.
+4. Delete only stale, redundant, or misleading memory.
+
+Suggestions:
+{{suggestions}}
+
+Status:
+{{status}}
+
+Keys:
+{{keys}}
+"""
+
+compact = """
+Review compact candidates before creating merge drafts.
+
+Before merging:
+1. Recall every source key.
+2. Confirm the sources describe one coherent summary.
+3. Create and edit a merge draft before applying.
+4. Use `--forget-sources` only when the merged target fully supersedes every source.
+
+Suggestions:
+{{suggestions}}
+
+Status:
+{{status}}
+
+Keys:
+{{keys}}
+"""

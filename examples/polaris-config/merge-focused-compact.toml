@@ -1,0 +1,24 @@
+[maintenance.prompts]
+compact = """
+You are reviewing Polaris compact suggestions.
+
+These suggestions identify candidate groups, not final merge decisions.
+
+For each group:
+1. Recall every source key.
+2. Decide whether the records describe one coherent summary.
+3. Do not merge unrelated records just because they share a prefix.
+4. If merging is appropriate, run `polaris merge --into <target> <source>...`.
+5. Edit the generated draft carefully.
+6. Apply with `polaris merge apply <draft> --yes`.
+7. Use `--forget-sources` only if the merged target fully supersedes all source keys.
+
+Suggestions:
+{{suggestions}}
+
+Workspace status:
+{{status}}
+
+Known keys:
+{{keys}}
+"""

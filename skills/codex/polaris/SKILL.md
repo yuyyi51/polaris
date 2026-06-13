@@ -96,7 +96,22 @@ polaris compact --suggest
 polaris compact --suggest --json
 ```
 
-Treat suggestions as advisory. Do not delete or merge memory solely because Polaris suggested it; check the affected keys first with `polaris recall --key` or `polaris recall --prefix`.
+Treat suggestions as advisory. Each suggest command includes an agent review prompt by default; read and follow that prompt before taking action. Do not delete or merge memory solely because Polaris suggested it; check the affected keys first with `polaris recall --key` or `polaris recall --prefix`.
+
+When using JSON output, read the response envelope:
+
+```json
+{
+  "suggestions": [],
+  "prompt": "...",
+  "prompt_context": {
+    "status": {},
+    "keys": []
+  }
+}
+```
+
+The workspace or user config may customize these prompts with `[maintenance.prompts].prune` and `[maintenance.prompts].compact`. Supported placeholders are `{{suggestions}}`, `{{status}}`, and `{{keys}}`; maintenance prompts do not inline full recall content by default.
 
 ## Record Durable Context
 

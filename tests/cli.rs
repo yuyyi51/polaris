@@ -1337,7 +1337,14 @@ fn prune_suggest_reports_human_json_and_no_suggestions_without_mutating() {
         .stdout(predicate::str::contains("decision.a"))
         .stdout(predicate::str::contains("duplicate exact text"))
         .stdout(predicate::str::contains("goal"))
-        .stdout(predicate::str::contains("replacement metadata"));
+        .stdout(predicate::str::contains("replacement metadata"))
+        .stdout(predicate::str::contains("Agent prompt:"))
+        .stdout(predicate::str::contains(
+            "You are reviewing Polaris prune suggestions",
+        ))
+        .stdout(predicate::str::contains("Known keys:"))
+        .stdout(predicate::str::contains("state.branch"))
+        .stdout(predicate::str::contains("same").not());
     assert_eq!(
         fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap(),
         before
@@ -1351,8 +1358,10 @@ fn prune_suggest_reports_human_json_and_no_suggestions_without_mutating() {
         .get_output()
         .stdout
         .clone();
-    let suggestions: Value = serde_json::from_slice(&output).expect("prune json");
-    let suggestions = suggestions.as_array().expect("suggestion array");
+    let response: Value = serde_json::from_slice(&output).expect("prune json");
+    let suggestions = response["suggestions"]
+        .as_array()
+        .expect("suggestion array");
     assert!(suggestions.iter().any(|suggestion| {
         suggestion["candidate_keys"]
             .as_array()
@@ -1364,6 +1373,20 @@ fn prune_suggest_reports_human_json_and_no_suggestions_without_mutating() {
         suggestions
             .iter()
             .any(|suggestion| suggestion["reasons"][0] == "duplicate exact text")
+    );
+    assert!(
+        response["prompt"]
+            .as_str()
+            .expect("prompt")
+            .contains("polaris recall --key")
+    );
+    assert_eq!(response["prompt_context"]["status"]["memory_count"], 4);
+    assert!(
+        response["prompt_context"]["keys"]
+            .as_array()
+            .expect("keys")
+            .iter()
+            .any(|key| key == "state.branch")
     );
 
     let clean = temp_workspace();
@@ -1380,7 +1403,8 @@ fn prune_suggest_reports_human_json_and_no_suggestions_without_mutating() {
         .success()
         .stdout(predicate::str::contains(
             "No prune suggestions are available",
-        ));
+        ))
+        .stdout(predicate::str::contains("Agent prompt:"));
 }
 
 #[test]
@@ -1389,7 +1413,7 @@ fn compact_suggest_reports_human_json_and_no_suggestions_without_mutating() {
     init_workspace(dir.path());
 
     for (key, text) in [
-        ("decision.storage", "storage decision"),
+        ("decision.storage", "private storage body"),
         ("decision.hooks", "hook decision"),
         ("state.branch", "branch state"),
     ] {
@@ -1411,7 +1435,13 @@ fn compact_suggest_reports_human_json_and_no_suggestions_without_mutating() {
         .stdout(predicate::str::contains("decision.hooks"))
         .stdout(predicate::str::contains(
             "polaris merge --into decision.summary",
-        ));
+        ))
+        .stdout(predicate::str::contains("Agent prompt:"))
+        .stdout(predicate::str::contains(
+            "You are reviewing Polaris compact suggestions",
+        ))
+        .stdout(predicate::str::contains("Known keys:"))
+        .stdout(predicate::str::contains("private storage body").not());
     assert_eq!(
         fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap(),
         before
@@ -1425,8 +1455,10 @@ fn compact_suggest_reports_human_json_and_no_suggestions_without_mutating() {
         .get_output()
         .stdout
         .clone();
-    let suggestions: Value = serde_json::from_slice(&output).expect("compact json");
-    let suggestions = suggestions.as_array().expect("suggestion array");
+    let response: Value = serde_json::from_slice(&output).expect("compact json");
+    let suggestions = response["suggestions"]
+        .as_array()
+        .expect("suggestion array");
     assert!(suggestions.iter().any(|suggestion| {
         suggestion["source_keys"]
             .as_array()
@@ -1435,6 +1467,20 @@ fn compact_suggest_reports_human_json_and_no_suggestions_without_mutating() {
             .any(|key| key == "decision.storage")
             && suggestion["proposed_target_key"] == "decision.summary"
     }));
+    assert!(
+        response["prompt"]
+            .as_str()
+            .expect("prompt")
+            .contains("polaris merge --into")
+    );
+    assert_eq!(response["prompt_context"]["status"]["memory_count"], 3);
+    assert!(
+        response["prompt_context"]["keys"]
+            .as_array()
+            .expect("keys")
+            .iter()
+            .any(|key| key == "decision.storage")
+    );
 
     let clean = temp_workspace();
     init_workspace(clean.path());
@@ -1450,6 +1496,89 @@ fn compact_suggest_reports_human_json_and_no_suggestions_without_mutating() {
         .success()
         .stdout(predicate::str::contains(
             "No compact suggestions are available",
+        ))
+        .stdout(predicate::str::contains("Agent prompt:"));
+}
+
+#[test]
+fn maintenance_prompts_use_workspace_config_with_supported_placeholders() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    fs::write(
+        dir.path().join(".polaris/config.toml"),
+        "[maintenance.prompts]\nprune = \"Workspace prune {{suggestions}} {{status}} {{keys}} {{unknown}}\"\ncompact = \"Workspace compact {{suggestions}} {{status}} {{keys}}\"\n",
+    )
+    .expect("write workspace config");
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "state.branch",
+            "--text",
+            "private branch",
+            "--lifecycle",
+            "state",
+        ])
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["prune", "--suggest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace prune"))
+        .stdout(predicate::str::contains("state.branch"))
+        .stdout(predicate::str::contains("\"memory_count\": 1"))
+        .stdout(predicate::str::contains("{{unknown}}"))
+        .stdout(predicate::str::contains("private branch").not());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["compact", "--suggest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace compact"))
+        .stdout(predicate::str::contains("\"state.branch\""))
+        .stdout(predicate::str::contains("private branch").not());
+}
+
+#[test]
+fn maintenance_prompts_use_user_config_and_missing_keys_fall_back_to_defaults() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    init_workspace(dir.path());
+    fs::create_dir_all(home.path().join(".polaris")).expect("create home polaris");
+    fs::write(
+        home.path().join(".polaris/config.toml"),
+        "[maintenance.prompts]\nprune = \"User prune {{keys}}\"\n",
+    )
+    .expect("write user config");
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "private goal"])
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["prune", "--suggest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("User prune"))
+        .stdout(predicate::str::contains("goal"))
+        .stdout(predicate::str::contains("private goal").not());
+
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["compact", "--suggest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "You are reviewing Polaris compact suggestions",
         ));
 }
 
