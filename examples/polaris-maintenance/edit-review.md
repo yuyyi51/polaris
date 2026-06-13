@@ -1,6 +1,6 @@
 # Polaris Memory Edit Review Examples
 
-These examples show safe, explicit maintenance flows for lifecycle cleanup and replacement review.
+These examples show safe, explicit maintenance flows for lifecycle cleanup, replacement review, and freshness updates.
 
 ## Reclassify Existing Inline Memory
 
@@ -61,3 +61,56 @@ polaris recall --key goal
 ```
 
 That can happen for memory replaced before replacement history was introduced or for records that have never been replaced.
+
+## Preview Replacement Before Writing
+
+Use a dry-run replacement when the new text should be reviewed or edited before it touches active memory:
+
+```bash
+polaris remember --key goal --replace --dry-run --text "Updated task goal."
+```
+
+The command prints a preview diff and returns a draft path under `.polaris/maintenance/`. Edit only the text under `## Replacement Memory`, then apply the reviewed draft explicitly:
+
+```bash
+polaris replace apply .polaris/maintenance/replace-goal-<id>.md --yes
+polaris diff --key goal
+```
+
+Dry-run replacement does not mutate active memory and does not write replacement history. Applying the draft uses normal replacement behavior, so `diff --key` can compare the previous memory with the applied text.
+
+## Recall Several Exact Keys
+
+Use multi-key recall when the next step needs a precise set of records in a stable order:
+
+```bash
+polaris recall --keys goal,plan,state.branch
+polaris recall --keys goal,plan,state.branch --exclude state.
+polaris recall --keys goal,decision.storage --lifecycle durable
+```
+
+Missing or filtered keys are reported in the output while matching keys are still recalled.
+
+## Refresh Still-Valid State
+
+Use touch when a state or log record is still accurate but stale reminders are no longer useful:
+
+```bash
+polaris touch --key state.branch
+polaris touch --keys state.branch,state.queue
+polaris touch --id 0123456789abcdef0123456789abcdef
+```
+
+Use confirmed prefix touch for a batch of related keyed inline records:
+
+```bash
+polaris touch --prefix state. --yes
+```
+
+Use JSON output when an agent needs to inspect touched records and missing keys:
+
+```bash
+polaris touch --keys state.branch,missing --json
+```
+
+Touch updates only `updated_at`. It preserves memory text, lifecycle, creation time, replacement metadata, and note file contents.

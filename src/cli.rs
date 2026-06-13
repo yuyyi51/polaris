@@ -1,7 +1,7 @@
 use crate::hook;
 use crate::storage::{
     DiffResult, LifecycleMoveRequest, MemoryFilter, MemoryInput, MemoryKind, MemoryLifecycle,
-    PolarisStore,
+    PolarisStore, TouchRequest,
 };
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
@@ -27,12 +27,14 @@ enum Command {
     Rename(RenameArgs),
     Lifecycle(LifecycleArgs),
     Diff(DiffArgs),
+    Replace(ReplaceArgs),
     Merge(MergeArgs),
     Prune(SuggestArgs),
     Compact(SuggestArgs),
     List(ListArgs),
     Note(NoteArgs),
     Recall(RecallArgs),
+    Touch(TouchArgs),
     Clear(ClearArgs),
     Hook(HookArgs),
 }
@@ -55,6 +57,8 @@ struct RememberArgs {
     title: Option<String>,
     #[arg(long)]
     replace: bool,
+    #[arg(long)]
+    dry_run: bool,
     #[arg(long)]
     lifecycle: Option<MemoryLifecycle>,
 }
@@ -115,6 +119,24 @@ struct DiffArgs {
 }
 
 #[derive(Args)]
+struct ReplaceArgs {
+    #[command(subcommand)]
+    command: ReplaceCommand,
+}
+
+#[derive(Subcommand)]
+enum ReplaceCommand {
+    Apply(ReplaceApplyArgs),
+}
+
+#[derive(Args)]
+struct ReplaceApplyArgs {
+    draft: PathBuf,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
 struct MergeArgs {
     #[command(subcommand)]
     command: Option<MergeCommand>,
@@ -161,11 +183,29 @@ struct RecallArgs {
     #[arg(long)]
     key: Option<String>,
     #[arg(long)]
+    keys: Option<String>,
+    #[arg(long)]
     prefix: Option<String>,
     #[arg(long = "exclude")]
     exclude_prefixes: Vec<String>,
     #[arg(long)]
     lifecycle: Option<MemoryLifecycle>,
+}
+
+#[derive(Args)]
+struct TouchArgs {
+    #[arg(long)]
+    key: Option<String>,
+    #[arg(long)]
+    keys: Option<String>,
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long)]
+    prefix: Option<String>,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -228,6 +268,9 @@ pub fn run() -> Result<()> {
         Command::Remember(args) => {
             let store = PolarisStore::from_current_dir()?;
             store.require_initialized()?;
+            if args.dry_run && !args.replace {
+                return Err(anyhow!("--dry-run requires --replace"));
+            }
             let key = args
                 .key
                 .filter(|key| !key.trim().is_empty())
@@ -240,6 +283,14 @@ pub fn run() -> Result<()> {
                 args.text
                     .ok_or_else(|| anyhow!("remember requires --text <text> or --stdin"))?
             };
+            if args.dry_run {
+                let draft = store.create_replacement_draft(&key, &text)?;
+                println!("Replacement draft preview for {}", draft.key);
+                print!("{}", draft.diff);
+                println!("Created replacement draft {}", draft.id);
+                println!("Path: {}", draft.path.display());
+                return Ok(());
+            }
             let record = store.remember(
                 MemoryInput {
                     key,
@@ -356,6 +407,17 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+        Command::Replace(args) => match args.command {
+            ReplaceCommand::Apply(args) => {
+                if !args.yes {
+                    return Err(anyhow!("refusing to apply replacement draft without --yes"));
+                }
+                let store = PolarisStore::from_current_dir()?;
+                store.require_initialized()?;
+                let target = store.apply_replacement_draft(&args.draft)?;
+                println!("Applied replacement draft to {target}");
+            }
+        },
         Command::Merge(args) => {
             let store = PolarisStore::from_current_dir()?;
             store.require_initialized()?;
@@ -463,20 +525,71 @@ pub fn run() -> Result<()> {
             }
         },
         Command::Recall(args) => {
+            if args.keys.is_some() && (args.key.is_some() || args.prefix.is_some()) {
+                return Err(anyhow!(
+                    "recall --keys selector conflict; --keys cannot be used with --key or --prefix"
+                ));
+            }
             if args.key.is_some() && args.prefix.is_some() {
                 return Err(anyhow!("recall --key cannot be used with --prefix"));
             }
             let store = PolarisStore::from_current_dir()?;
             store.require_initialized()?;
-            print!(
-                "{}",
-                store.recall_filtered(&MemoryFilter {
-                    key: args.key,
-                    prefix: args.prefix,
-                    exclude_prefixes: args.exclude_prefixes,
-                    lifecycle: args.lifecycle,
-                })?
-            );
+            let filter = MemoryFilter {
+                key: args.key,
+                prefix: args.prefix,
+                exclude_prefixes: args.exclude_prefixes,
+                lifecycle: args.lifecycle,
+            };
+            if let Some(keys) = args.keys {
+                let keys = parse_csv_values(&keys, "--keys")?;
+                print!("{}", store.recall_keys(&keys, &filter)?);
+            } else {
+                print!("{}", store.recall_filtered(&filter)?);
+            }
+        }
+        Command::Touch(args) => {
+            let store = PolarisStore::from_current_dir()?;
+            store.require_initialized()?;
+            validate_touch_args(&args)?;
+            let report = store.touch(TouchRequest {
+                key: args.key,
+                keys: args
+                    .keys
+                    .as_deref()
+                    .map(|keys| parse_csv_values(keys, "--keys"))
+                    .transpose()?
+                    .unwrap_or_default(),
+                id: args.id,
+                prefix: args.prefix,
+            })?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Touched {} {}",
+                    report.touched.len(),
+                    memory_word(report.touched.len())
+                );
+                for record in report.touched {
+                    let label = record
+                        .key
+                        .or(record.title)
+                        .or(record.path)
+                        .unwrap_or_else(|| record.id.clone());
+                    println!("- {} {label}", record.id);
+                }
+                if !report.missing_keys.is_empty() {
+                    println!("Missing keys: {}", report.missing_keys.join(", "));
+                }
+                if !report.skipped.is_empty() {
+                    println!(
+                        "Skipped {} {}",
+                        report.skipped.len(),
+                        memory_word(report.skipped.len())
+                    );
+                }
+            }
         }
         Command::Clear(args) => {
             if !args.yes {
@@ -550,6 +663,56 @@ fn validate_lifecycle_move_args(args: &LifecycleMoveArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_touch_args(args: &TouchArgs) -> Result<()> {
+    let selectors = [
+        args.key.is_some(),
+        args.keys.is_some(),
+        args.id.is_some(),
+        args.prefix.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+
+    if selectors == 0 {
+        return Err(anyhow!(
+            "touch requires exactly one selector: --key, --keys, --id, or --prefix"
+        ));
+    }
+    if selectors > 1 {
+        return Err(anyhow!(
+            "touch selectors conflict; use exactly one of --key, --keys, --id, or --prefix"
+        ));
+    }
+    if args.key.as_deref().is_some_and(str::is_empty)
+        || args.id.as_deref().is_some_and(str::is_empty)
+        || args.prefix.as_deref().is_some_and(str::is_empty)
+    {
+        return Err(anyhow!("touch selector values must not be empty"));
+    }
+    if let Some(keys) = args.keys.as_deref() {
+        parse_csv_values(keys, "--keys")?;
+    }
+    if args.prefix.is_some() && !args.yes {
+        return Err(anyhow!("prefix touch requires --yes"));
+    }
+
+    Ok(())
+}
+
+fn parse_csv_values(value: &str, flag: &str) -> Result<Vec<String>> {
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err(anyhow!("{flag} requires at least one non-empty value"));
+    }
+    Ok(values)
 }
 
 fn memory_word(count: usize) -> &'static str {

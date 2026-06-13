@@ -163,9 +163,21 @@ pub struct CreatedMergeDraft {
     pub path: PathBuf,
 }
 
+pub struct CreatedReplacementDraft {
+    pub id: String,
+    pub path: PathBuf,
+    pub key: String,
+    pub diff: String,
+}
+
 struct MergeDraft {
     target: String,
     sources: Vec<String>,
+    text: String,
+}
+
+struct ReplacementDraft {
+    target: String,
     text: String,
 }
 
@@ -297,6 +309,47 @@ pub struct ReplacementDiff {
 pub enum DiffResult {
     Available(ReplacementDiff),
     NoSnapshot { key: String },
+}
+
+pub struct TouchRequest {
+    pub key: Option<String>,
+    pub keys: Vec<String>,
+    pub id: Option<String>,
+    pub prefix: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct TouchReport {
+    pub touched: Vec<TouchRecord>,
+    pub missing_keys: Vec<String>,
+    pub skipped: Vec<TouchSkippedRecord>,
+}
+
+#[derive(Serialize)]
+pub struct TouchRecord {
+    pub id: String,
+    pub kind: MemoryKind,
+    pub previous_updated_at: Option<String>,
+    pub new_updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct TouchSkippedRecord {
+    pub id: String,
+    pub kind: MemoryKind,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 enum MaintenancePromptKind {
@@ -578,6 +631,74 @@ impl PolarisStore {
         })
     }
 
+    pub fn create_replacement_draft(
+        &self,
+        key: &str,
+        text: &str,
+    ) -> Result<CreatedReplacementDraft> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(anyhow!("target key must not be empty"));
+        }
+
+        let records = self.load_records()?;
+        let current = records
+            .iter()
+            .find(|record| record.is_inline_key(key))
+            .cloned()
+            .ok_or_else(|| anyhow!("No memory exists for key `{key}`"))?;
+
+        fs::create_dir_all(self.maintenance_dir())?;
+        let id = new_id();
+        let file_name = format!("replace-{}-{}.md", slugify(key), id);
+        let relative_path = PathBuf::from(POLARIS_DIR)
+            .join(MAINTENANCE_DIR)
+            .join(file_name);
+        let absolute_path = self.workspace.join(&relative_path);
+        fs::write(
+            &absolute_path,
+            render_replacement_draft(key, &current, text)?,
+        )?;
+
+        Ok(CreatedReplacementDraft {
+            id,
+            path: relative_path,
+            key: key.to_string(),
+            diff: unified_diff(
+                "current",
+                current.text.as_deref().unwrap_or(""),
+                "replacement",
+                text,
+            ),
+        })
+    }
+
+    pub fn apply_replacement_draft(&self, draft_path: &Path) -> Result<String> {
+        let absolute_path = if draft_path.is_absolute() {
+            draft_path.to_path_buf()
+        } else {
+            self.workspace.join(draft_path)
+        };
+        let draft =
+            parse_replacement_draft(&fs::read_to_string(&absolute_path).with_context(|| {
+                format!(
+                    "failed to read replacement draft {}",
+                    absolute_path.display()
+                )
+            })?)?;
+
+        self.remember(
+            MemoryInput {
+                key: draft.target.clone(),
+                title: None,
+                text: draft.text,
+                lifecycle: None,
+            },
+            true,
+        )?;
+        Ok(draft.target)
+    }
+
     pub fn apply_merge_draft(&self, draft_path: &Path, forget_sources: bool) -> Result<String> {
         let absolute_path = if draft_path.is_absolute() {
             draft_path.to_path_buf()
@@ -720,6 +841,59 @@ impl PolarisStore {
         }))
     }
 
+    pub fn touch(&self, request: TouchRequest) -> Result<TouchReport> {
+        let _lock = self.lock_memories_exclusive()?;
+        let mut records = self.load_records_unlocked()?;
+        let timestamp = now();
+        let mut touched = Vec::new();
+        let mut missing_keys = Vec::new();
+        let skipped = Vec::new();
+
+        if let Some(key) = request.key.as_deref() {
+            if let Some(index) = records.iter().position(|record| record.is_inline_key(key)) {
+                touch_record(&mut records[index], &timestamp, &mut touched);
+            } else {
+                return Err(anyhow!("No memory exists for key `{key}`"));
+            }
+        } else if !request.keys.is_empty() {
+            for key in &request.keys {
+                if let Some(index) = records.iter().position(|record| record.is_inline_key(key)) {
+                    touch_record(&mut records[index], &timestamp, &mut touched);
+                } else {
+                    missing_keys.push(key.clone());
+                }
+            }
+        } else if let Some(id) = request.id.as_deref() {
+            if let Some(index) = records.iter().position(|record| record.id == id) {
+                touch_record(&mut records[index], &timestamp, &mut touched);
+            } else {
+                return Err(anyhow!("No memory exists for id `{id}`"));
+            }
+        } else if let Some(prefix) = request.prefix.as_deref() {
+            let indexes = records
+                .iter()
+                .enumerate()
+                .filter_map(|(index, record)| record.is_inline_key_prefix(prefix).then_some(index))
+                .collect::<Vec<_>>();
+            if indexes.is_empty() {
+                return Err(anyhow!("No memory exists for prefix `{prefix}`"));
+            }
+            for index in indexes {
+                touch_record(&mut records[index], &timestamp, &mut touched);
+            }
+        }
+
+        if !touched.is_empty() {
+            self.write_records(&records)?;
+        }
+
+        Ok(TouchReport {
+            touched,
+            missing_keys,
+            skipped,
+        })
+    }
+
     pub fn recall(&self) -> Result<String> {
         self.recall_filtered(&MemoryFilter::default())
     }
@@ -736,6 +910,33 @@ impl PolarisStore {
         }
 
         Self::render_recall(filtered)
+    }
+
+    pub fn recall_keys(&self, keys: &[String], filter: &MemoryFilter) -> Result<String> {
+        let records = self.load_records()?;
+        let mut filtered = Vec::new();
+        let mut missing = Vec::new();
+
+        for key in keys {
+            if let Some(record) = records
+                .iter()
+                .find(|record| record.is_inline_key(key) && record.matches_filter(filter))
+            {
+                filtered.push(record.clone());
+            } else {
+                missing.push(key.clone());
+            }
+        }
+
+        let mut output = if filtered.is_empty() {
+            "No matching Polaris memory is stored for this workspace.\n".to_string()
+        } else {
+            Self::render_recall(filtered)?
+        };
+        if !missing.is_empty() {
+            output.push_str(&format!("Missing keys: {}\n", missing.join(", ")));
+        }
+        Ok(output)
     }
 
     fn render_recall(records: Vec<MemoryRecord>) -> Result<String> {
@@ -1514,6 +1715,32 @@ fn render_merge_draft(
     Ok(output)
 }
 
+fn render_replacement_draft(target: &str, current: &MemoryRecord, text: &str) -> Result<String> {
+    let mut output = String::new();
+    output.push_str("<!-- polaris-replace-draft-v1\n");
+    output.push_str(&format!("key: {target}\n"));
+    output.push_str(&format!("current_id: {}\n", current.id));
+    output.push_str("-->\n\n");
+    output.push_str("# Polaris Replacement Draft\n\n");
+    output.push_str(
+        "Edit the text under `## Replacement Memory`, then run `polaris replace apply <path> --yes`.\n\n",
+    );
+    output.push_str("## Current Memory\n\n");
+    output.push_str(&format!("- id: {}\n", current.id));
+    output.push_str(&format!("- created_at: {}\n", current.created_at));
+    if let Some(updated_at) = current.updated_at.as_deref() {
+        output.push_str(&format!("- updated_at: {updated_at}\n"));
+    }
+    output.push_str(&format!("- lifecycle: {}\n", current.effective_lifecycle()));
+    output.push_str("\n```text\n");
+    output.push_str(current.text.as_deref().unwrap_or(""));
+    output.push_str("\n```\n\n");
+    output.push_str("## Replacement Memory\n\n");
+    output.push_str(text);
+    output.push('\n');
+    Ok(output)
+}
+
 fn parse_merge_draft(contents: &str) -> Result<MergeDraft> {
     let Some(header) = contents.strip_prefix("<!-- polaris-merge-draft-v1\n") else {
         return Err(anyhow!(
@@ -1566,6 +1793,59 @@ fn parse_merge_draft(contents: &str) -> Result<MergeDraft> {
         sources,
         text,
     })
+}
+
+fn parse_replacement_draft(contents: &str) -> Result<ReplacementDraft> {
+    let Some(header) = contents.strip_prefix("<!-- polaris-replace-draft-v1\n") else {
+        return Err(anyhow!(
+            "replacement draft cannot be applied: missing Polaris replacement draft header"
+        ));
+    };
+    let Some((metadata, body)) = header.split_once("-->") else {
+        return Err(anyhow!(
+            "replacement draft cannot be applied: missing Polaris replacement draft metadata terminator"
+        ));
+    };
+
+    let mut target = None;
+    for line in metadata.lines() {
+        if let Some(value) = line
+            .strip_prefix("key: ")
+            .or_else(|| line.strip_prefix("target: "))
+        {
+            target = Some(value.trim().to_string());
+        }
+    }
+    let target = target
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| anyhow!("replacement draft cannot be applied: target key is missing"))?;
+    let Some((_, text)) = body.split_once("## Replacement Memory\n") else {
+        return Err(anyhow!(
+            "replacement draft cannot be applied: missing `## Replacement Memory` section"
+        ));
+    };
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(anyhow!(
+            "replacement draft cannot be applied: replacement memory text is empty"
+        ));
+    }
+
+    Ok(ReplacementDraft { target, text })
+}
+
+fn touch_record(record: &mut MemoryRecord, timestamp: &str, touched: &mut Vec<TouchRecord>) {
+    let previous_updated_at = record.updated_at.clone();
+    record.updated_at = Some(timestamp.to_string());
+    touched.push(TouchRecord {
+        id: record.id.clone(),
+        kind: record.kind,
+        previous_updated_at,
+        new_updated_at: timestamp.to_string(),
+        key: record.key.clone(),
+        title: record.title.clone(),
+        path: record.path.clone(),
+    });
 }
 
 fn new_id() -> String {

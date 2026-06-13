@@ -11,8 +11,15 @@ polaris remember --key goal --text "task goal" --title "Goal"
 polaris remember --key decision --stdin --title "Decision" --lifecycle durable
 polaris remember --key state.branch --text "working on filters" --lifecycle state
 polaris remember --key goal --replace --text "updated task goal"
+polaris remember --key goal --replace --dry-run --text "updated task goal"
+polaris replace apply .polaris/maintenance/replace-goal-<id>.md --yes
 polaris diff --key goal
 polaris diff --key goal --json
+polaris touch --key state.branch
+polaris touch --keys state.branch,state.queue
+polaris touch --id <record-id>
+polaris touch --prefix state. --yes
+polaris touch --keys state.branch,missing --json
 polaris lifecycle move --key state.branch --to state
 polaris lifecycle move --prefix state. --from durable --to state --yes
 polaris lifecycle move --id <record-id> --to archive
@@ -27,6 +34,7 @@ polaris list --json
 polaris list --json --lifecycle state
 polaris recall
 polaris recall --key goal
+polaris recall --keys goal,plan,state.branch
 polaris recall --prefix decision.
 polaris recall --exclude state.
 polaris recall --lifecycle durable
@@ -75,7 +83,28 @@ polaris diff --key goal --json
 
 Diff compares the current active keyed inline memory with the latest saved replacement snapshot. Existing records replaced before replacement history existed remain valid, but `diff --key` reports that no snapshot is available for those keys.
 
-Use `polaris list --keys` for one key per line, or `polaris list --json` for machine-readable record summaries without inline memory text. Add `--lifecycle <value>` to `polaris list --json` to inspect one lifecycle. Use `polaris recall --key <key>`, `polaris recall --prefix <prefix>`, `polaris recall --exclude <prefix>`, or `polaris recall --lifecycle <value>` to recover only relevant context. Lifecycle recall composes with exact key, prefix, and exclude-prefix filters.
+Use `remember --replace --dry-run` before important replacements when you want to review or edit the new text before mutation:
+
+```bash
+polaris remember --key goal --replace --dry-run --text "updated task goal"
+polaris replace apply .polaris/maintenance/replace-goal-<id>.md --yes
+```
+
+Dry-run replacement creates an editable draft under `.polaris/maintenance/` and prints a preview diff. It does not mutate `.polaris/memories.jsonl` and does not write `.polaris/replacement-history.jsonl`. Applying the draft with `polaris replace apply ... --yes` uses the normal replacement path, including replacement metadata and history.
+
+Use `polaris touch` to refresh `updated_at` for still-valid records without changing text, lifecycle, `created_at`, replacement metadata, or note file contents:
+
+```bash
+polaris touch --key state.branch
+polaris touch --keys state.branch,state.queue
+polaris touch --id <record-id>
+polaris touch --prefix state. --yes
+polaris touch --keys state.branch,missing --json
+```
+
+Exact key, multi-key, and id selectors do not require confirmation. Prefix touch requires `--yes` because it can update many records. JSON output reports touched records, missing keys, and skipped records.
+
+Use `polaris list --keys` for one key per line, or `polaris list --json` for machine-readable record summaries without inline memory text. Add `--lifecycle <value>` to `polaris list --json` to inspect one lifecycle. Use `polaris recall --key <key>`, `polaris recall --keys <key1,key2,...>`, `polaris recall --prefix <prefix>`, `polaris recall --exclude <prefix>`, or `polaris recall --lifecycle <value>` to recover only relevant context. Multi-key recall renders matching keys in request order and reports missing or filtered keys without failing. Lifecycle recall composes with exact key, multi-key, prefix, and exclude-prefix filters.
 
 `polaris status --json` includes lifecycle counts and advisory `stale_volatile_memory` hints for old `state` and `log` records. These hints are machine-readable and do not change command exit status.
 

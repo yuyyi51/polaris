@@ -57,6 +57,24 @@ fn assert_jsonl_records(path: &Path, expected_count: usize) -> Vec<Value> {
     records
 }
 
+fn assert_jsonl_records_if_exists(path: &Path, expected_count: usize) -> Vec<Value> {
+    if path.exists() {
+        assert_jsonl_records(path, expected_count)
+    } else {
+        assert_eq!(expected_count, 0, "expected JSONL file {}", path.display());
+        Vec::new()
+    }
+}
+
+fn path_from_output(output: &[u8], prefix: &str) -> String {
+    let output = String::from_utf8(output.to_vec()).expect("utf8 output");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("missing `{prefix}` line in output:\n{output}"))
+        .to_string()
+}
+
 fn hook_context(output: &[u8]) -> String {
     let hook: Value = serde_json::from_slice(output).expect("hook json");
     hook["hookSpecificOutput"]["additionalContext"]
@@ -1291,6 +1309,237 @@ fn diff_reports_no_snapshot_and_rejects_missing_or_uninitialized_keys() {
 }
 
 #[test]
+fn remember_replace_dry_run_creates_editable_draft_without_mutating_memory() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "old goal"])
+        .assert()
+        .success();
+    let before = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--replace",
+            "--dry-run",
+            "--text",
+            "new goal",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Replacement draft preview for goal",
+        ))
+        .stdout(predicate::str::contains("-old goal"))
+        .stdout(predicate::str::contains("+new goal"))
+        .stdout(predicate::str::contains(
+            "Path: .polaris/maintenance/replace-goal-",
+        ))
+        .get_output()
+        .stdout
+        .clone();
+    let draft_path = path_from_output(&output, "Path: ");
+    let draft = fs::read_to_string(dir.path().join(&draft_path)).expect("replace draft");
+    assert!(draft.contains("polaris-replace-draft-v1"));
+    assert!(draft.contains("key: goal"));
+    assert!(draft.contains("## Current Memory"));
+    assert!(draft.contains("old goal"));
+    assert!(draft.contains("## Replacement Memory"));
+    assert!(draft.contains("new goal"));
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap(),
+        before
+    );
+    assert_jsonl_records_if_exists(&dir.path().join(".polaris/replacement-history.jsonl"), 0);
+}
+
+#[test]
+fn remember_replace_dry_run_accepts_stdin_and_requires_replace() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "old goal"])
+        .assert()
+        .success();
+    let before = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--replace",
+            "--dry-run",
+            "--stdin",
+        ])
+        .write_stdin("stdin replacement\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let draft_path = path_from_output(&output, "Path: ");
+    let draft = fs::read_to_string(dir.path().join(&draft_path)).expect("replace draft");
+    assert!(draft.contains("## Replacement Memory\n\nstdin replacement\n"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--dry-run", "--text", "bad"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--dry-run requires --replace"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn replace_apply_uses_edited_draft_and_writes_replacement_history() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--text",
+            "old goal",
+            "--lifecycle",
+            "state",
+        ])
+        .assert()
+        .success();
+    let initial = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    let initial_id = initial[0]["id"].as_str().expect("initial id").to_string();
+    let created_at = initial[0]["created_at"].clone();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--replace",
+            "--dry-run",
+            "--text",
+            "draft goal",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let draft_path = path_from_output(&output, "Path: ");
+    let full_draft_path = dir.path().join(&draft_path);
+    let draft = fs::read_to_string(&full_draft_path).expect("replace draft");
+    fs::write(
+        &full_draft_path,
+        draft.replace("draft goal", "edited replacement goal"),
+    )
+    .unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["replace", "apply", &draft_path, "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Applied replacement draft to goal",
+        ));
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    assert_eq!(records[0]["key"], "goal");
+    assert_eq!(records[0]["text"], "edited replacement goal");
+    assert_eq!(records[0]["created_at"], created_at);
+    assert_eq!(records[0]["lifecycle"], "state");
+    assert_eq!(records[0]["replacement_count"], 1);
+    assert_eq!(records[0]["replaced_from"], initial_id);
+
+    let history = assert_jsonl_records(&dir.path().join(".polaris/replacement-history.jsonl"), 1);
+    assert_eq!(history[0]["id"], initial_id);
+    assert_eq!(history[0]["text"], "old goal");
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["diff", "--key", "goal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("-old goal"))
+        .stdout(predicate::str::contains("+edited replacement goal"));
+}
+
+#[test]
+fn replace_apply_requires_confirmation_and_rejects_invalid_drafts() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "old goal"])
+        .assert()
+        .success();
+    let output = polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--replace",
+            "--dry-run",
+            "--text",
+            "new goal",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let draft_path = path_from_output(&output, "Path: ");
+    let before = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["replace", "apply", &draft_path])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--yes"));
+
+    let bad_path = dir.path().join(".polaris/maintenance/bad-replace.md");
+    fs::write(&bad_path, "not a replacement draft").unwrap();
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "replace",
+            "apply",
+            ".polaris/maintenance/bad-replace.md",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "replacement draft cannot be applied",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn status_json_reports_lifecycle_counts_and_stale_volatile_hints() {
     let dir = temp_workspace();
     init_workspace(dir.path());
@@ -1404,6 +1653,286 @@ fn recall_filters_by_key_prefix_and_excluded_prefix() {
         .assert()
         .success()
         .stdout(predicate::str::contains("No matching Polaris memory"));
+}
+
+#[test]
+fn recall_keys_renders_in_requested_order_and_reports_missing_or_filtered_keys() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    for (key, text, lifecycle) in [
+        ("goal", "goal memory", "durable"),
+        ("plan", "plan memory", "durable"),
+        ("state.branch", "state memory", "state"),
+        ("other", "other memory", "durable"),
+    ] {
+        polaris()
+            .current_dir(dir.path())
+            .args([
+                "remember",
+                "--key",
+                key,
+                "--text",
+                text,
+                "--lifecycle",
+                lifecycle,
+            ])
+            .assert()
+            .success();
+    }
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--keys", "plan,goal,state.branch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("other memory").not())
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    let plan = output.find("plan memory").expect("plan");
+    let goal = output.find("goal memory").expect("goal");
+    let state = output.find("state memory").expect("state");
+    assert!(plan < goal);
+    assert!(goal < state);
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--keys", "goal,missing"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("goal memory"))
+        .stdout(predicate::str::contains("Missing keys: missing"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--keys", "missing,absent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No matching Polaris memory"))
+        .stdout(predicate::str::contains("Missing keys: missing, absent"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "recall",
+            "--keys",
+            "goal,state.branch",
+            "--lifecycle",
+            "durable",
+            "--exclude",
+            "state.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("goal memory"))
+        .stdout(predicate::str::contains("state memory").not())
+        .stdout(predicate::str::contains("Missing keys: state.branch"));
+}
+
+#[test]
+fn recall_keys_rejects_selector_conflicts() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--keys", "goal,plan", "--key", "goal"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--keys"))
+        .stderr(predicate::str::contains("conflict"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--keys", "goal,plan", "--prefix", "goal"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--keys"))
+        .stderr(predicate::str::contains("conflict"));
+}
+
+#[test]
+fn touch_updates_timestamps_without_changing_memory_content_or_metadata() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    fs::write(
+        dir.path().join(".polaris/memories.jsonl"),
+        concat!(
+            "{\"id\":\"state\",\"created_at\":\"2026-05-01T00:00:00Z\",\"updated_at\":\"2026-05-02T00:00:00Z\",\"kind\":\"inline\",\"key\":\"state.branch\",\"text\":\"branch\",\"lifecycle\":\"state\",\"replacement_count\":2,\"replaced_from\":\"old-state\"}\n",
+            "{\"id\":\"queue\",\"created_at\":\"2026-05-01T00:00:00Z\",\"kind\":\"inline\",\"key\":\"state.queue\",\"text\":\"queue\",\"lifecycle\":\"state\"}\n",
+            "{\"id\":\"goal\",\"created_at\":\"2026-05-01T00:00:00Z\",\"kind\":\"inline\",\"key\":\"goal\",\"text\":\"goal\",\"lifecycle\":\"durable\"}\n",
+        ),
+    )
+    .unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["touch", "--key", "state.branch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Touched 1 memory"))
+        .stdout(predicate::str::contains("state.branch"));
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 3);
+    let state = records
+        .iter()
+        .find(|record| record["key"] == "state.branch")
+        .expect("state");
+    assert_eq!(state["id"], "state");
+    assert_eq!(state["created_at"], "2026-05-01T00:00:00Z");
+    assert_ne!(state["updated_at"], "2026-05-02T00:00:00Z");
+    assert_eq!(state["text"], "branch");
+    assert_eq!(state["lifecycle"], "state");
+    assert_eq!(state["replacement_count"], 2);
+    assert_eq!(state["replaced_from"], "old-state");
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["touch", "--keys", "state.branch,state.queue"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Touched 2 memories"));
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 3);
+    assert!(
+        records
+            .iter()
+            .filter(|record| record["key"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("state.")))
+            .all(|record| record["updated_at"].as_str().is_some())
+    );
+    let goal = records
+        .iter()
+        .find(|record| record["key"] == "goal")
+        .expect("goal");
+    assert!(goal.get("updated_at").is_none());
+}
+
+#[test]
+fn touch_updates_note_by_id_and_prefix_with_confirmation() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "note",
+            "create",
+            "--title",
+            "State note",
+            "--lifecycle",
+            "state",
+        ])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "state.branch", "--text", "branch"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "goal"])
+        .assert()
+        .success();
+
+    let before = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 3);
+    let note = before
+        .iter()
+        .find(|record| record["kind"] == "note")
+        .expect("note");
+    let note_id = note["id"].as_str().expect("note id").to_string();
+    let note_path = dir.path().join(note["path"].as_str().expect("note path"));
+    let note_contents = fs::read_to_string(&note_path).expect("note contents");
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["touch", "--id", &note_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&note_id));
+    assert_eq!(fs::read_to_string(&note_path).unwrap(), note_contents);
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["touch", "--prefix", "state."])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--yes"));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["touch", "--prefix", "state.", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Touched 1 memory"));
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 3);
+    assert!(
+        records
+            .iter()
+            .find(|record| record["key"] == "state.branch")
+            .expect("state branch")["updated_at"]
+            .as_str()
+            .is_some()
+    );
+    assert!(
+        records
+            .iter()
+            .find(|record| record["key"] == "goal")
+            .expect("goal")
+            .get("updated_at")
+            .is_none()
+    );
+}
+
+#[test]
+fn touch_rejects_conflicting_selectors_and_reports_json() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "state.branch", "--text", "branch"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "state.queue", "--text", "queue"])
+        .assert()
+        .success();
+    let before = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 2);
+    let id = before[0]["id"].as_str().expect("id").to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["touch", "--key", "state.branch", "--id", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("selectors conflict"));
+    assert!(
+        assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 2)
+            .iter()
+            .all(|record| record.get("updated_at").is_none())
+    );
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["touch", "--keys", "state.branch,missing", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("touch json");
+    assert_eq!(report["touched"].as_array().expect("touched").len(), 1);
+    assert_eq!(report["touched"][0]["key"], "state.branch");
+    assert!(report["touched"][0]["previous_updated_at"].is_null());
+    assert!(report["touched"][0]["new_updated_at"].as_str().is_some());
+    assert_eq!(report["missing_keys"][0], "missing");
+    assert_eq!(report["skipped"].as_array().expect("skipped").len(), 0);
 }
 
 #[test]

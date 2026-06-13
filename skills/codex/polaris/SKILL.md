@@ -45,6 +45,7 @@ polaris list --json
 ```bash
 polaris recall
 polaris recall --key goal
+polaris recall --keys goal,plan,state.branch
 polaris recall --prefix decision.
 polaris recall --exclude state.
 polaris recall --lifecycle durable
@@ -83,6 +84,18 @@ Use `--json` when you need machine-readable moved and skipped records:
 ```bash
 polaris lifecycle move --prefix state. --to state --yes --json
 ```
+
+Refresh `updated_at` when a state or log record is still correct but stale reminders are noisy. Touch changes freshness metadata only; it does not edit text, lifecycle, creation time, replacement metadata, or note file contents.
+
+```bash
+polaris touch --key state.branch
+polaris touch --keys state.branch,state.queue
+polaris touch --id <record-id>
+polaris touch --prefix state. --yes
+polaris touch --keys state.branch,missing --json
+```
+
+Use exact keys or ids for small updates. Prefix touch requires `--yes` because it can affect many records.
 
 Create a merge draft when several keyed memories should become one durable summary:
 
@@ -160,6 +173,15 @@ Use stable keys such as `goal`, `plan`, `decision.storage`, `blocker`, and `veri
 polaris remember --key goal --replace --text "Implement keyed memory replacement and forgetting." --lifecycle durable
 ```
 
+For important durable replacements, preview first and apply the editable draft only after review:
+
+```bash
+polaris remember --key goal --replace --dry-run --text "Implement keyed memory replacement, review drafts, and stale-state refresh."
+polaris replace apply .polaris/maintenance/replace-goal-<id>.md --yes
+```
+
+Dry-run replacement creates a draft under `.polaris/maintenance/`, prints a diff, and leaves active memory and replacement history unchanged until `replace apply --yes`.
+
 After replacing important durable memory, review the latest change before relying on it:
 
 ```bash
@@ -187,6 +209,7 @@ When inspecting memory, prefer lifecycle filters over key-name guessing:
 ```bash
 polaris list --json --lifecycle state
 polaris recall --lifecycle durable
+polaris recall --keys goal,plan,state.branch
 polaris recall --prefix decision. --lifecycle durable
 ```
 
