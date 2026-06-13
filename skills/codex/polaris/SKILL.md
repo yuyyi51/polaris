@@ -59,6 +59,45 @@ polaris forget --prefix decision. --yes
 polaris clear --yes
 ```
 
+## Maintain Memory Safely
+
+Use maintenance commands when memory keys or content need cleanup. Inspect first, then apply only explicit mutations.
+
+Rename a keyed inline memory when the key changed but the content is still correct:
+
+```bash
+polaris rename old.key new.key
+```
+
+Create a merge draft when several keyed memories should become one durable summary:
+
+```bash
+polaris merge --into decision.summary decision.storage decision.hooks
+```
+
+Open the returned `.polaris/maintenance/` draft path, edit only the text under `## Merged Memory`, then apply it with confirmation:
+
+```bash
+polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes
+```
+
+Use `--forget-sources` only when the merged target fully replaces the source keys:
+
+```bash
+polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes --forget-sources
+```
+
+Suggestion commands are read-only. Use them to decide what to inspect, rename, merge, or forget:
+
+```bash
+polaris prune --suggest
+polaris prune --suggest --json
+polaris compact --suggest
+polaris compact --suggest --json
+```
+
+Treat suggestions as advisory. Do not delete or merge memory solely because Polaris suggested it; check the affected keys first with `polaris recall --key` or `polaris recall --prefix`.
+
 ## Record Durable Context
 
 Before starting meaningful work, record the task facts that would matter after compaction:

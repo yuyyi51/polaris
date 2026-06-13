@@ -21,6 +21,10 @@ enum Command {
     Status(StatusArgs),
     Remember(RememberArgs),
     Forget(ForgetArgs),
+    Rename(RenameArgs),
+    Merge(MergeArgs),
+    Prune(SuggestArgs),
+    Compact(SuggestArgs),
     List(ListArgs),
     Note(NoteArgs),
     Recall(RecallArgs),
@@ -58,6 +62,44 @@ struct ForgetArgs {
     prefix: Option<String>,
     #[arg(long)]
     yes: bool,
+}
+
+#[derive(Args)]
+struct RenameArgs {
+    old_key: String,
+    new_key: String,
+}
+
+#[derive(Args)]
+struct MergeArgs {
+    #[command(subcommand)]
+    command: Option<MergeCommand>,
+    #[arg(long)]
+    into: Option<String>,
+    #[arg(value_name = "SOURCE")]
+    sources: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum MergeCommand {
+    Apply(MergeApplyArgs),
+}
+
+#[derive(Args)]
+struct MergeApplyArgs {
+    draft: PathBuf,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    forget_sources: bool,
+}
+
+#[derive(Args)]
+struct SuggestArgs {
+    #[arg(long)]
+    suggest: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -183,6 +225,84 @@ pub fn run() -> Result<()> {
                     println!("Forgot memory {}", args.keys[0]);
                 } else {
                     println!("Forgot {removed} memories");
+                }
+            }
+        }
+        Command::Rename(args) => {
+            let store = PolarisStore::from_current_dir()?;
+            store.require_initialized()?;
+            store.rename_key(&args.old_key, &args.new_key)?;
+            println!("Renamed memory {} to {}", args.old_key, args.new_key);
+        }
+        Command::Merge(args) => {
+            let store = PolarisStore::from_current_dir()?;
+            store.require_initialized()?;
+            match args.command {
+                Some(MergeCommand::Apply(apply_args)) => {
+                    if !apply_args.yes {
+                        return Err(anyhow!("refusing to apply merge draft without --yes"));
+                    }
+                    let target =
+                        store.apply_merge_draft(&apply_args.draft, apply_args.forget_sources)?;
+                    println!("Applied merge draft to {target}");
+                }
+                None => {
+                    let target = args
+                        .into
+                        .ok_or_else(|| anyhow!("merge requires --into <target>"))?;
+                    let draft = store.create_merge_draft(&target, &args.sources)?;
+                    println!("Created merge draft {}", draft.id);
+                    println!("Path: {}", draft.path.display());
+                }
+            }
+        }
+        Command::Prune(args) => {
+            if !args.suggest {
+                return Err(anyhow!("prune currently requires --suggest"));
+            }
+            let store = PolarisStore::from_current_dir()?;
+            store.require_initialized()?;
+            let suggestions = store.prune_suggestions()?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&suggestions)?);
+            } else if suggestions.is_empty() {
+                println!("No prune suggestions are available.");
+            } else {
+                println!("Prune suggestions:");
+                for suggestion in suggestions {
+                    println!("- {}", suggestion.candidate_keys.join(", "));
+                    for reason in suggestion.reasons {
+                        println!("  Reason: {reason}");
+                    }
+                    for command in suggestion.suggested_commands {
+                        println!("  Command: {command}");
+                    }
+                }
+            }
+        }
+        Command::Compact(args) => {
+            if !args.suggest {
+                return Err(anyhow!("compact currently requires --suggest"));
+            }
+            let store = PolarisStore::from_current_dir()?;
+            store.require_initialized()?;
+            let suggestions = store.compact_suggestions()?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&suggestions)?);
+            } else if suggestions.is_empty() {
+                println!("No compact suggestions are available.");
+            } else {
+                println!("Compact suggestions:");
+                for suggestion in suggestions {
+                    println!(
+                        "- {} -> {}",
+                        suggestion.source_keys.join(", "),
+                        suggestion.proposed_target_key
+                    );
+                    for reason in suggestion.reasons {
+                        println!("  Reason: {reason}");
+                    }
+                    println!("  Command: {}", suggestion.suggested_command);
                 }
             }
         }

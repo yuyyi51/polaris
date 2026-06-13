@@ -11,6 +11,7 @@ polaris remember --key goal --text "task goal" --title "Goal"
 polaris remember --key decision --stdin --title "Decision" --lifecycle durable
 polaris remember --key state.branch --text "working on filters" --lifecycle state
 polaris remember --key goal --replace --text "updated task goal"
+polaris rename old.key new.key
 polaris forget goal
 polaris forget goal plan
 polaris forget --prefix decision. --yes
@@ -23,6 +24,13 @@ polaris recall --key goal
 polaris recall --prefix decision.
 polaris recall --exclude state.
 polaris recall --lifecycle durable
+polaris merge --into decision.summary decision.storage decision.hooks
+polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes
+polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes --forget-sources
+polaris prune --suggest
+polaris prune --suggest --json
+polaris compact --suggest
+polaris compact --suggest --json
 polaris clear --yes
 polaris hook session-start
 polaris hook post-compact
@@ -45,6 +53,18 @@ Use `polaris list --keys` for one key per line, or `polaris list --json` for mac
 `polaris status --json` includes lifecycle counts and advisory `stale_volatile_memory` hints for old `state` and `log` records. These hints are machine-readable and do not change command exit status.
 
 Use `polaris forget <key>` or `polaris forget <key>...` to remove selected keyed inline memories. Use `polaris forget --prefix <prefix> --yes` for confirmed prefix cleanup, or `polaris clear --yes` to clear all Polaris memory and note files.
+
+Use `polaris rename <old-key> <new-key>` to rename a keyed inline memory without changing its text or metadata. Rename rejects missing sources and existing destination keys.
+
+Use `polaris merge --into <target-key> <source-key>...` to create an editable markdown draft under `.polaris/maintenance/`. Draft creation does not mutate active memory. Edit the text under `## Merged Memory`, then apply it explicitly:
+
+```bash
+polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes
+```
+
+Add `--forget-sources` to remove the source keyed inline memories in the same confirmed apply operation. Invalid drafts and unconfirmed apply commands leave active memory unchanged.
+
+Use `polaris prune --suggest` and `polaris compact --suggest` to inspect deterministic maintenance suggestions without mutating memory. Add `--json` for machine-readable suggestions. Prune suggestions flag old volatile records, duplicate exact text, and replacement metadata. Compact suggestions flag shared key prefixes and related lifecycle groups.
 
 ## Codex Hook
 

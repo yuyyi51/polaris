@@ -974,6 +974,486 @@ fn recall_filters_by_key_prefix_and_excluded_prefix() {
 }
 
 #[test]
+fn rename_changes_key_and_preserves_memory_text_and_metadata() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "old.key",
+            "--text",
+            "keep this text",
+            "--lifecycle",
+            "state",
+        ])
+        .assert()
+        .success();
+    let before = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    let created_at = before[0]["created_at"].clone();
+    let id = before[0]["id"].clone();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["rename", "old.key", "new.key"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Renamed memory old.key to new.key",
+        ));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "new.key"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("keep this text"));
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "old.key"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No matching Polaris memory"));
+
+    let after = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    assert_eq!(after[0]["id"], id);
+    assert_eq!(after[0]["created_at"], created_at);
+    assert_eq!(after[0]["key"], "new.key");
+    assert_eq!(after[0]["lifecycle"], "state");
+    assert_eq!(after[0]["text"], "keep this text");
+}
+
+#[test]
+fn rename_rejects_missing_source_and_existing_destination_without_mutating() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "old.key", "--text", "old text"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "existing.key",
+            "--text",
+            "existing text",
+        ])
+        .assert()
+        .success();
+    let before = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["rename", "missing", "new.key"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "source key `missing` does not exist",
+        ));
+    let after_missing = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+    assert_eq!(after_missing, before);
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["rename", "old.key", "existing.key"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "destination key `existing.key` already exists",
+        ));
+    let after_existing = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+    assert_eq!(after_existing, before);
+}
+
+#[test]
+fn merge_creates_editable_draft_without_mutating_memory() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "keyA",
+            "--text",
+            "alpha text",
+            "--lifecycle",
+            "state",
+        ])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "keyB", "--text", "beta text"])
+        .assert()
+        .success();
+    let before = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["merge", "--into", "model.summary", "keyA", "keyB"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created merge draft"))
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    let draft_path = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Path: "))
+        .expect("draft path in output");
+    let draft = fs::read_to_string(dir.path().join(draft_path)).expect("read draft");
+    assert!(draft.contains("polaris-merge-draft-v1"));
+    assert!(draft.contains("target: model.summary"));
+    assert!(draft.contains("sources: keyA,keyB"));
+    assert!(draft.contains("## Source keyA"));
+    assert!(draft.contains("- lifecycle: state"));
+    assert!(draft.contains("alpha text"));
+    assert!(draft.contains("## Source keyB"));
+    assert!(draft.contains("beta text"));
+    assert!(draft.contains("## Merged Memory"));
+
+    let after = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn merge_draft_rejects_missing_sources_and_empty_target_without_mutating() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "keyA", "--text", "alpha text"])
+        .assert()
+        .success();
+    let before = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["merge", "--into", "model.summary", "keyA", "missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "source key `missing` does not exist",
+        ));
+    assert!(!dir.path().join(".polaris/maintenance").exists());
+    let after_missing = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+    assert_eq!(after_missing, before);
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["merge", "--into", "", "keyA"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("target key must not be empty"));
+    let after_empty = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+    assert_eq!(after_empty, before);
+}
+
+#[test]
+fn merge_apply_writes_or_replaces_target_from_edited_draft() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    for (key, text) in [
+        ("model.summary", "old summary"),
+        ("keyA", "alpha text"),
+        ("keyB", "beta text"),
+    ] {
+        polaris()
+            .current_dir(dir.path())
+            .args(["remember", "--key", key, "--text", text])
+            .assert()
+            .success();
+    }
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["merge", "--into", "model.summary", "keyA", "keyB"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    let draft_path = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Path: "))
+        .expect("draft path in output");
+    fs::write(
+        dir.path().join(draft_path),
+        "<!-- polaris-merge-draft-v1\ntarget: model.summary\nsources: keyA,keyB\n-->\n\n# Polaris Merge Draft\n\n## Merged Memory\n\nmerged summary\n",
+    )
+    .expect("edit draft");
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["merge", "apply", draft_path, "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Applied merge draft to model.summary",
+        ));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "model.summary"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("merged summary"))
+        .stdout(predicate::str::contains("old summary").not());
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "keyA"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alpha text"));
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 3);
+    let target = records
+        .iter()
+        .find(|record| record["key"] == "model.summary")
+        .expect("target record");
+    assert_eq!(target["replacement_count"], 1);
+}
+
+#[test]
+fn merge_apply_requires_confirmation_can_forget_sources_and_rejects_invalid_drafts() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    for (key, text) in [("keyA", "alpha text"), ("keyB", "beta text")] {
+        polaris()
+            .current_dir(dir.path())
+            .args(["remember", "--key", key, "--text", text])
+            .assert()
+            .success();
+    }
+    let before = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+    let bad_draft = dir.path().join(".polaris/maintenance/bad.md");
+    fs::create_dir_all(bad_draft.parent().expect("bad draft parent")).unwrap();
+    fs::write(&bad_draft, "not a merge draft").unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["merge", "apply", ".polaris/maintenance/bad.md"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--yes"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap(),
+        before
+    );
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["merge", "apply", ".polaris/maintenance/bad.md", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be applied"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap(),
+        before
+    );
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["merge", "--into", "model.summary", "keyA", "keyB"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    let draft_path = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Path: "))
+        .expect("draft path in output");
+    fs::write(
+        dir.path().join(draft_path),
+        "<!-- polaris-merge-draft-v1\ntarget: model.summary\nsources: keyA,keyB\n-->\n\n# Polaris Merge Draft\n\n## Merged Memory\n\nmerged summary\n",
+    )
+    .expect("edit draft");
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["merge", "apply", draft_path, "--yes", "--forget-sources"])
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "model.summary"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("merged summary"));
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "keyA"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No matching Polaris memory"));
+    polaris()
+        .current_dir(dir.path())
+        .args(["recall", "--key", "keyB"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No matching Polaris memory"));
+}
+
+#[test]
+fn prune_suggest_reports_human_json_and_no_suggestions_without_mutating() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+    fs::write(
+        dir.path().join(".polaris/memories.jsonl"),
+        concat!(
+            "{\"id\":\"old-state\",\"created_at\":\"2026-05-01T00:00:00Z\",\"kind\":\"inline\",\"key\":\"state.branch\",\"text\":\"branch\",\"lifecycle\":\"state\"}\n",
+            "{\"id\":\"dup-a\",\"created_at\":\"2026-06-11T00:00:00Z\",\"kind\":\"inline\",\"key\":\"decision.a\",\"text\":\"same\",\"lifecycle\":\"durable\"}\n",
+            "{\"id\":\"dup-b\",\"created_at\":\"2026-06-11T00:00:00Z\",\"kind\":\"inline\",\"key\":\"decision.b\",\"text\":\"same\",\"lifecycle\":\"durable\"}\n",
+            "{\"id\":\"replaced\",\"created_at\":\"2026-06-01T00:00:00Z\",\"updated_at\":\"2026-06-11T00:00:00Z\",\"kind\":\"inline\",\"key\":\"goal\",\"text\":\"new\",\"lifecycle\":\"durable\",\"replacement_count\":2,\"replaced_from\":\"old-goal\"}\n",
+        ),
+    )
+    .unwrap();
+    let before = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["prune", "--suggest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Prune suggestions"))
+        .stdout(predicate::str::contains("state.branch"))
+        .stdout(predicate::str::contains("old volatile memory"))
+        .stdout(predicate::str::contains("decision.a"))
+        .stdout(predicate::str::contains("duplicate exact text"))
+        .stdout(predicate::str::contains("goal"))
+        .stdout(predicate::str::contains("replacement metadata"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap(),
+        before
+    );
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["prune", "--suggest", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let suggestions: Value = serde_json::from_slice(&output).expect("prune json");
+    let suggestions = suggestions.as_array().expect("suggestion array");
+    assert!(suggestions.iter().any(|suggestion| {
+        suggestion["candidate_keys"]
+            .as_array()
+            .expect("candidate keys")
+            .iter()
+            .any(|key| key == "state.branch")
+    }));
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion["reasons"][0] == "duplicate exact text")
+    );
+
+    let clean = temp_workspace();
+    init_workspace(clean.path());
+    polaris()
+        .current_dir(clean.path())
+        .args(["remember", "--key", "goal", "--text", "goal"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(clean.path())
+        .args(["prune", "--suggest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No prune suggestions are available",
+        ));
+}
+
+#[test]
+fn compact_suggest_reports_human_json_and_no_suggestions_without_mutating() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    for (key, text) in [
+        ("decision.storage", "storage decision"),
+        ("decision.hooks", "hook decision"),
+        ("state.branch", "branch state"),
+    ] {
+        polaris()
+            .current_dir(dir.path())
+            .args(["remember", "--key", key, "--text", text])
+            .assert()
+            .success();
+    }
+    let before = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["compact", "--suggest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Compact suggestions"))
+        .stdout(predicate::str::contains("decision.storage"))
+        .stdout(predicate::str::contains("decision.hooks"))
+        .stdout(predicate::str::contains(
+            "polaris merge --into decision.summary",
+        ));
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap(),
+        before
+    );
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["compact", "--suggest", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let suggestions: Value = serde_json::from_slice(&output).expect("compact json");
+    let suggestions = suggestions.as_array().expect("suggestion array");
+    assert!(suggestions.iter().any(|suggestion| {
+        suggestion["source_keys"]
+            .as_array()
+            .expect("source keys")
+            .iter()
+            .any(|key| key == "decision.storage")
+            && suggestion["proposed_target_key"] == "decision.summary"
+    }));
+
+    let clean = temp_workspace();
+    init_workspace(clean.path());
+    polaris()
+        .current_dir(clean.path())
+        .args(["remember", "--key", "goal", "--text", "goal"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(clean.path())
+        .args(["compact", "--suggest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No compact suggestions are available",
+        ));
+}
+
+#[test]
 fn forget_removes_multiple_keys_atomically() {
     let dir = temp_workspace();
 

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -14,6 +14,7 @@ const HOOK_STATE_FILE: &str = "hook-state.json";
 const MEMORIES_FILE: &str = "memories.jsonl";
 const MEMORIES_LOCK_FILE: &str = "memories.lock";
 const DOCS_DIR: &str = "docs";
+const MAINTENANCE_DIR: &str = "maintenance";
 const STALE_VOLATILE_DAYS: i64 = 7;
 
 #[derive(Debug)]
@@ -113,6 +114,17 @@ pub struct CreatedNote {
     pub path: PathBuf,
 }
 
+pub struct CreatedMergeDraft {
+    pub id: String,
+    pub path: PathBuf,
+}
+
+struct MergeDraft {
+    target: String,
+    sources: Vec<String>,
+    text: String,
+}
+
 #[derive(Serialize)]
 pub struct Status {
     initialized: bool,
@@ -141,6 +153,21 @@ pub struct StaleVolatileRecord {
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct PruneSuggestion {
+    pub candidate_keys: Vec<String>,
+    pub reasons: Vec<String>,
+    pub suggested_commands: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct CompactSuggestion {
+    pub source_keys: Vec<String>,
+    pub proposed_target_key: String,
+    pub reasons: Vec<String>,
+    pub suggested_command: String,
 }
 
 impl PolarisStore {
@@ -292,6 +319,29 @@ impl PolarisStore {
         Ok(removed)
     }
 
+    pub fn rename_key(&self, old_key: &str, new_key: &str) -> Result<()> {
+        if old_key.trim().is_empty() {
+            return Err(anyhow!("source key must not be empty"));
+        }
+        if new_key.trim().is_empty() {
+            return Err(anyhow!("destination key must not be empty"));
+        }
+
+        let _lock = self.lock_memories_exclusive()?;
+        let mut records = self.load_records_unlocked()?;
+        let source_index = records
+            .iter()
+            .position(|record| record.is_inline_key(old_key))
+            .ok_or_else(|| anyhow!("source key `{old_key}` does not exist"))?;
+        if records.iter().any(|record| record.is_inline_key(new_key)) {
+            return Err(anyhow!("destination key `{new_key}` already exists"));
+        }
+
+        records[source_index].key = Some(new_key.to_string());
+        self.write_records(&records)?;
+        Ok(())
+    }
+
     fn write_records(&self, records: &[MemoryRecord]) -> Result<()> {
         let temp_path = self
             .root()
@@ -348,6 +398,108 @@ impl PolarisStore {
             id,
             path: relative_path,
         })
+    }
+
+    pub fn create_merge_draft(
+        &self,
+        target: &str,
+        sources: &[String],
+    ) -> Result<CreatedMergeDraft> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err(anyhow!("target key must not be empty"));
+        }
+        if sources.is_empty() {
+            return Err(anyhow!("merge requires at least one source key"));
+        }
+
+        let records = self.load_records()?;
+        let mut source_records = Vec::new();
+        for source in sources {
+            let record = records
+                .iter()
+                .find(|record| record.is_inline_key(source))
+                .cloned()
+                .ok_or_else(|| anyhow!("source key `{source}` does not exist"))?;
+            source_records.push(record);
+        }
+
+        fs::create_dir_all(self.maintenance_dir())?;
+        let id = new_id();
+        let file_name = format!("merge-{}-{}.md", slugify(target), id);
+        let relative_path = PathBuf::from(POLARIS_DIR)
+            .join(MAINTENANCE_DIR)
+            .join(file_name);
+        let absolute_path = self.workspace.join(&relative_path);
+        fs::write(
+            &absolute_path,
+            render_merge_draft(target, sources, &source_records)?,
+        )?;
+
+        Ok(CreatedMergeDraft {
+            id,
+            path: relative_path,
+        })
+    }
+
+    pub fn apply_merge_draft(&self, draft_path: &Path, forget_sources: bool) -> Result<String> {
+        let absolute_path = if draft_path.is_absolute() {
+            draft_path.to_path_buf()
+        } else {
+            self.workspace.join(draft_path)
+        };
+        let draft =
+            parse_merge_draft(&fs::read_to_string(&absolute_path).with_context(|| {
+                format!("failed to read merge draft {}", absolute_path.display())
+            })?)?;
+
+        let _lock = self.lock_memories_exclusive()?;
+        let mut records = self.load_records_unlocked()?;
+        if forget_sources {
+            for source in &draft.sources {
+                if !records.iter().any(|record| record.is_inline_key(source)) {
+                    return Err(anyhow!("source key `{source}` does not exist"));
+                }
+            }
+        }
+
+        let now = now();
+        let existing = records
+            .iter()
+            .find(|record| record.is_inline_key(&draft.target))
+            .cloned();
+        let mut target_record = MemoryRecord {
+            id: new_id(),
+            created_at: now.clone(),
+            updated_at: None,
+            kind: MemoryKind::Inline,
+            lifecycle: Some(MemoryLifecycle::Durable),
+            replacement_count: None,
+            replaced_from: None,
+            key: Some(draft.target.clone()),
+            title: None,
+            text: Some(draft.text),
+            path: None,
+        };
+        if let Some(existing) = existing {
+            target_record.created_at = existing.created_at;
+            target_record.updated_at = Some(now);
+            target_record.lifecycle = existing.lifecycle;
+            target_record.replacement_count = Some(existing.replacement_count.unwrap_or(0) + 1);
+            target_record.replaced_from = Some(existing.id);
+        }
+
+        records.retain(|record| {
+            !(record.is_inline_key(&draft.target)
+                || forget_sources
+                    && record
+                        .key
+                        .as_deref()
+                        .is_some_and(|key| draft.sources.iter().any(|source| source == key)))
+        });
+        records.push(target_record);
+        self.write_records(&records)?;
+        Ok(draft.target)
     }
 
     pub fn recall(&self) -> Result<String> {
@@ -420,6 +572,16 @@ impl PolarisStore {
             .filter(|record| record.matches_filter(filter))
             .map(MemorySummary::from)
             .collect())
+    }
+
+    pub fn prune_suggestions(&self) -> Result<Vec<PruneSuggestion>> {
+        let records = self.load_records()?;
+        Ok(prune_suggestions(&records))
+    }
+
+    pub fn compact_suggestions(&self) -> Result<Vec<CompactSuggestion>> {
+        let records = self.load_records()?;
+        Ok(compact_suggestions(&records))
     }
 
     pub fn clear(&self) -> Result<()> {
@@ -581,6 +743,10 @@ impl PolarisStore {
     fn docs_dir(&self) -> PathBuf {
         self.root().join(DOCS_DIR)
     }
+
+    fn maintenance_dir(&self) -> PathBuf {
+        self.root().join(MAINTENANCE_DIR)
+    }
 }
 
 impl MemoryRecord {
@@ -741,10 +907,221 @@ fn stale_volatile_memory(records: &[MemoryRecord]) -> StaleVolatileMemory {
     }
 }
 
+fn prune_suggestions(records: &[MemoryRecord]) -> Vec<PruneSuggestion> {
+    let threshold = Utc::now() - Duration::days(STALE_VOLATILE_DAYS);
+    let mut suggestions = Vec::new();
+
+    for record in keyed_inline_records(records) {
+        let lifecycle = record.effective_lifecycle();
+        if matches!(lifecycle, MemoryLifecycle::State | MemoryLifecycle::Log)
+            && is_before_threshold(
+                record.updated_at.as_deref().unwrap_or(&record.created_at),
+                threshold,
+            )
+            && let Some(key) = record.key.clone()
+        {
+            suggestions.push(PruneSuggestion {
+                candidate_keys: vec![key.clone()],
+                reasons: vec![format!("old volatile memory ({lifecycle})")],
+                suggested_commands: vec![format!("polaris forget {key}")],
+            });
+        }
+    }
+
+    let mut text_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for record in keyed_inline_records(records) {
+        if let (Some(key), Some(text)) = (record.key.as_ref(), record.text.as_ref())
+            && !text.trim().is_empty()
+        {
+            text_keys.entry(text.clone()).or_default().push(key.clone());
+        }
+    }
+    for keys in text_keys.values().filter(|keys| keys.len() > 1) {
+        suggestions.push(PruneSuggestion {
+            candidate_keys: keys.clone(),
+            reasons: vec!["duplicate exact text".to_string()],
+            suggested_commands: keys
+                .iter()
+                .skip(1)
+                .map(|key| format!("polaris forget {key}"))
+                .collect(),
+        });
+    }
+
+    for record in keyed_inline_records(records) {
+        if record.replacement_count.unwrap_or(0) > 0
+            && let Some(key) = record.key.clone()
+        {
+            suggestions.push(PruneSuggestion {
+                candidate_keys: vec![key.clone()],
+                reasons: vec![
+                    "replacement metadata indicates prior superseded content".to_string(),
+                ],
+                suggested_commands: vec![format!("polaris recall --key {key}")],
+            });
+        }
+    }
+
+    suggestions
+}
+
+fn compact_suggestions(records: &[MemoryRecord]) -> Vec<CompactSuggestion> {
+    let mut suggestions = Vec::new();
+    let mut prefix_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for record in keyed_inline_records(records) {
+        if let Some(key) = record.key.as_ref()
+            && let Some((prefix, _)) = key.split_once('.')
+        {
+            prefix_keys
+                .entry(prefix.to_string())
+                .or_default()
+                .push(key.clone());
+        }
+    }
+    for (prefix, keys) in prefix_keys {
+        if keys.len() > 1 {
+            let target = format!("{prefix}.summary");
+            suggestions.push(CompactSuggestion {
+                source_keys: keys.clone(),
+                proposed_target_key: target.clone(),
+                reasons: vec![format!("shared key prefix `{prefix}.`")],
+                suggested_command: format!("polaris merge --into {target} {}", keys.join(" ")),
+            });
+        }
+    }
+
+    let mut lifecycle_keys: BTreeMap<MemoryLifecycle, Vec<String>> = BTreeMap::new();
+    for record in keyed_inline_records(records) {
+        let lifecycle = record.effective_lifecycle();
+        if matches!(lifecycle, MemoryLifecycle::State | MemoryLifecycle::Log)
+            && let Some(key) = record.key.clone()
+        {
+            lifecycle_keys.entry(lifecycle).or_default().push(key);
+        }
+    }
+    for (lifecycle, keys) in lifecycle_keys {
+        if keys.len() > 2 {
+            let target = format!("{lifecycle}.summary");
+            suggestions.push(CompactSuggestion {
+                source_keys: keys.clone(),
+                proposed_target_key: target.clone(),
+                reasons: vec![format!("related `{lifecycle}` lifecycle records")],
+                suggested_command: format!("polaris merge --into {target} {}", keys.join(" ")),
+            });
+        }
+    }
+
+    suggestions
+}
+
+fn keyed_inline_records(records: &[MemoryRecord]) -> impl Iterator<Item = &MemoryRecord> {
+    records
+        .iter()
+        .filter(|record| matches!(record.kind, MemoryKind::Inline) && record.key.is_some())
+}
+
 fn is_before_threshold(timestamp: &str, threshold: DateTime<Utc>) -> bool {
     DateTime::parse_from_rfc3339(timestamp)
         .map(|timestamp| timestamp.with_timezone(&Utc) < threshold)
         .unwrap_or(false)
+}
+
+fn render_merge_draft(
+    target: &str,
+    sources: &[String],
+    records: &[MemoryRecord],
+) -> Result<String> {
+    let mut output = String::new();
+    output.push_str("<!-- polaris-merge-draft-v1\n");
+    output.push_str(&format!("target: {target}\n"));
+    output.push_str(&format!("sources: {}\n", sources.join(",")));
+    output.push_str("-->\n\n");
+    output.push_str("# Polaris Merge Draft\n\n");
+    output.push_str(
+        "Edit the text under `## Merged Memory`, then run `polaris merge apply <path> --yes`.\n\n",
+    );
+    output.push_str("## Sources\n\n");
+    for record in records {
+        let key = record
+            .key
+            .as_deref()
+            .ok_or_else(|| anyhow!("merge source record is missing key"))?;
+        output.push_str(&format!("## Source {key}\n"));
+        output.push_str(&format!("- id: {}\n", record.id));
+        output.push_str(&format!("- created_at: {}\n", record.created_at));
+        if let Some(updated_at) = record.updated_at.as_deref() {
+            output.push_str(&format!("- updated_at: {updated_at}\n"));
+        }
+        output.push_str(&format!("- lifecycle: {}\n", record.effective_lifecycle()));
+        output.push_str("\n```text\n");
+        output.push_str(record.text.as_deref().unwrap_or(""));
+        output.push_str("\n```\n\n");
+    }
+    output.push_str("## Merged Memory\n\n");
+    for record in records {
+        let key = record
+            .key
+            .as_deref()
+            .ok_or_else(|| anyhow!("merge source record is missing key"))?;
+        output.push_str(&format!("From {key}:\n"));
+        output.push_str(record.text.as_deref().unwrap_or(""));
+        output.push_str("\n\n");
+    }
+    Ok(output)
+}
+
+fn parse_merge_draft(contents: &str) -> Result<MergeDraft> {
+    let Some(header) = contents.strip_prefix("<!-- polaris-merge-draft-v1\n") else {
+        return Err(anyhow!(
+            "merge draft cannot be applied: missing Polaris merge draft header"
+        ));
+    };
+    let Some((metadata, body)) = header.split_once("-->") else {
+        return Err(anyhow!(
+            "merge draft cannot be applied: missing Polaris merge draft metadata terminator"
+        ));
+    };
+
+    let mut target = None;
+    let mut sources = None;
+    for line in metadata.lines() {
+        if let Some(value) = line.strip_prefix("target: ") {
+            target = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("sources: ") {
+            sources = Some(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|source| !source.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    let target = target
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| anyhow!("merge draft cannot be applied: target key is missing"))?;
+    let sources = sources
+        .filter(|sources| !sources.is_empty())
+        .ok_or_else(|| anyhow!("merge draft cannot be applied: source keys are missing"))?;
+    let Some((_, text)) = body.split_once("## Merged Memory\n") else {
+        return Err(anyhow!(
+            "merge draft cannot be applied: missing `## Merged Memory` section"
+        ));
+    };
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(anyhow!(
+            "merge draft cannot be applied: merged memory text is empty"
+        ));
+    }
+
+    Ok(MergeDraft {
+        target,
+        sources,
+        text,
+    })
 }
 
 fn new_id() -> String {
