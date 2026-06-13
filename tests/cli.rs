@@ -858,6 +858,439 @@ fn remember_replace_updates_metadata_and_preserves_creation_and_lifecycle() {
 }
 
 #[test]
+fn lifecycle_move_updates_inline_memory_by_key_and_prefix() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "state.branch", "--text", "branch text"])
+        .assert()
+        .success();
+    let before = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    let created_at = before[0]["created_at"].clone();
+    let id = before[0]["id"].clone();
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "lifecycle",
+            "move",
+            "--key",
+            "state.branch",
+            "--to",
+            "state",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Moved 1 memory"))
+        .stdout(predicate::str::contains("state.branch"));
+
+    let after = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    assert_eq!(after[0]["id"], id);
+    assert_eq!(after[0]["created_at"], created_at);
+    assert_eq!(after[0]["key"], "state.branch");
+    assert_eq!(after[0]["text"], "branch text");
+    assert_eq!(after[0]["lifecycle"], "state");
+    assert!(after[0]["updated_at"].as_str().is_some());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "state.plan", "--text", "plan text"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "goal text"])
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "lifecycle",
+            "move",
+            "--prefix",
+            "state.",
+            "--from",
+            "durable",
+            "--to",
+            "state",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Moved 1 memory"))
+        .stdout(predicate::str::contains("Skipped 1 memory"));
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 3);
+    assert!(
+        records
+            .iter()
+            .any(|record| { record["key"] == "state.branch" && record["lifecycle"] == "state" })
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| { record["key"] == "state.plan" && record["lifecycle"] == "state" })
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["key"] == "goal" && record.get("lifecycle").is_none())
+    );
+}
+
+#[test]
+fn lifecycle_move_updates_notes_by_id_and_kind_without_touching_note_file() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "note",
+            "create",
+            "--title",
+            "Current note",
+            "--lifecycle",
+            "log",
+        ])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["note", "create", "--title", "Durable note"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "log.inline",
+            "--text",
+            "inline log",
+            "--lifecycle",
+            "log",
+        ])
+        .assert()
+        .success();
+
+    let before = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 3);
+    let current_note = before
+        .iter()
+        .find(|record| record["title"] == "Current note")
+        .expect("current note");
+    let current_id = current_note["id"].as_str().expect("note id").to_string();
+    let note_path = dir
+        .path()
+        .join(current_note["path"].as_str().expect("note path"));
+    let note_contents = fs::read_to_string(&note_path).expect("note file");
+    let created_at = current_note["created_at"].clone();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["lifecycle", "move", "--id", &current_id, "--to", "archive"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&current_id));
+
+    assert_eq!(
+        fs::read_to_string(&note_path).expect("note file"),
+        note_contents
+    );
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 3);
+    let current_note = records
+        .iter()
+        .find(|record| record["id"] == current_id)
+        .expect("current note");
+    assert_eq!(current_note["lifecycle"], "archive");
+    assert_eq!(current_note["created_at"], created_at);
+    assert!(current_note["updated_at"].as_str().is_some());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "lifecycle",
+            "move",
+            "--kind",
+            "note",
+            "--from",
+            "durable",
+            "--to",
+            "archive",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Moved 1 memory"));
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 3);
+    assert!(
+        records
+            .iter()
+            .filter(|record| record["kind"] == "note")
+            .all(|record| record["lifecycle"] == "archive")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| { record["key"] == "log.inline" && record["lifecycle"] == "log" })
+    );
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "lifecycle",
+            "move",
+            "--kind",
+            "inline",
+            "--from",
+            "log",
+            "--to",
+            "state",
+            "--yes",
+        ])
+        .assert()
+        .success();
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 3);
+    assert!(
+        records
+            .iter()
+            .any(|record| { record["key"] == "log.inline" && record["lifecycle"] == "state" })
+    );
+}
+
+#[test]
+fn lifecycle_move_requires_confirmation_for_batches_and_rejects_conflicting_selectors() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "state.branch", "--text", "branch"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["note", "create", "--title", "A note"])
+        .assert()
+        .success();
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 2);
+    let note_id = records
+        .iter()
+        .find(|record| record["kind"] == "note")
+        .expect("note")["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["lifecycle", "move", "--prefix", "state.", "--to", "state"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--yes"));
+    assert!(
+        assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 2)
+            .iter()
+            .all(|record| record.get("lifecycle").is_none())
+    );
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "lifecycle",
+            "move",
+            "--key",
+            "state.branch",
+            "--id",
+            &note_id,
+            "--to",
+            "state",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("selectors conflict"));
+    assert!(
+        assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 2)
+            .iter()
+            .all(|record| record.get("lifecycle").is_none())
+    );
+}
+
+#[test]
+fn lifecycle_move_json_reports_moved_and_skipped_records() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "state.one", "--text", "one"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "state.two",
+            "--text",
+            "two",
+            "--lifecycle",
+            "state",
+        ])
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args([
+            "lifecycle",
+            "move",
+            "--prefix",
+            "state.",
+            "--to",
+            "state",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).expect("move json");
+    let moved = report["moved"].as_array().expect("moved records");
+    let skipped = report["skipped"].as_array().expect("skipped records");
+    assert_eq!(moved.len(), 1);
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(moved[0]["key"], "state.one");
+    assert_eq!(moved[0]["previous_lifecycle"], "durable");
+    assert_eq!(moved[0]["new_lifecycle"], "state");
+    assert_eq!(skipped[0]["key"], "state.two");
+    assert_eq!(skipped[0]["reason"], "already at target lifecycle");
+}
+
+#[test]
+fn replace_saves_history_and_diff_reports_latest_replacement() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "line one\nold line"])
+        .assert()
+        .success();
+    let initial = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    let initial_id = initial[0]["id"].as_str().expect("initial id").to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--replace",
+            "--text",
+            "line one\nnew line",
+        ])
+        .assert()
+        .success();
+
+    let history = assert_jsonl_records(&dir.path().join(".polaris/replacement-history.jsonl"), 1);
+    assert_eq!(history[0]["id"], initial_id);
+    assert_eq!(history[0]["text"], "line one\nold line");
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["diff", "--key", "goal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Diff for memory goal"))
+        .stdout(predicate::str::contains("--- previous"))
+        .stdout(predicate::str::contains("+++ current"))
+        .stdout(predicate::str::contains("-old line"))
+        .stdout(predicate::str::contains("+new line"));
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["diff", "--key", "goal", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let diff: Value = serde_json::from_slice(&output).expect("diff json");
+    assert_eq!(diff["key"], "goal");
+    assert_eq!(diff["previous_id"], initial_id);
+    assert!(diff["current_id"].as_str().is_some());
+    assert!(diff["diff"].as_str().expect("diff").contains("-old line"));
+    assert!(diff["diff"].as_str().expect("diff").contains("+new line"));
+}
+
+#[test]
+fn diff_reports_no_snapshot_and_rejects_missing_or_uninitialized_keys() {
+    let dir = temp_workspace();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["diff", "--key", "goal"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("polaris init"));
+
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["diff", "--key", "missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No memory exists for key `missing`",
+        ));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "stable goal"])
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["diff", "--key", "goal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No replacement snapshot is available for goal",
+        ));
+
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    let updated = records[0].clone();
+    let mut object = updated.as_object().expect("record object").clone();
+    object.insert(
+        "replaced_from".to_string(),
+        Value::String("legacy-missing".to_string()),
+    );
+    fs::write(
+        dir.path().join(".polaris/memories.jsonl"),
+        format!("{}\n", Value::Object(object)),
+    )
+    .unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["diff", "--key", "goal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No replacement snapshot is available for goal",
+        ));
+}
+
+#[test]
 fn status_json_reports_lifecycle_counts_and_stale_volatile_hints() {
     let dir = temp_workspace();
     init_workspace(dir.path());

@@ -1,5 +1,8 @@
 use crate::hook;
-use crate::storage::{MemoryFilter, MemoryInput, MemoryLifecycle, PolarisStore};
+use crate::storage::{
+    DiffResult, LifecycleMoveRequest, MemoryFilter, MemoryInput, MemoryKind, MemoryLifecycle,
+    PolarisStore,
+};
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, Read};
@@ -22,6 +25,8 @@ enum Command {
     Remember(RememberArgs),
     Forget(ForgetArgs),
     Rename(RenameArgs),
+    Lifecycle(LifecycleArgs),
+    Diff(DiffArgs),
     Merge(MergeArgs),
     Prune(SuggestArgs),
     Compact(SuggestArgs),
@@ -68,6 +73,45 @@ struct ForgetArgs {
 struct RenameArgs {
     old_key: String,
     new_key: String,
+}
+
+#[derive(Args)]
+struct LifecycleArgs {
+    #[command(subcommand)]
+    command: LifecycleCommand,
+}
+
+#[derive(Subcommand)]
+enum LifecycleCommand {
+    Move(LifecycleMoveArgs),
+}
+
+#[derive(Args)]
+struct LifecycleMoveArgs {
+    #[arg(long)]
+    key: Option<String>,
+    #[arg(long)]
+    prefix: Option<String>,
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long)]
+    kind: Option<MemoryKind>,
+    #[arg(long)]
+    from: Option<MemoryLifecycle>,
+    #[arg(long)]
+    to: MemoryLifecycle,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DiffArgs {
+    #[arg(long)]
+    key: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -234,6 +278,84 @@ pub fn run() -> Result<()> {
             store.rename_key(&args.old_key, &args.new_key)?;
             println!("Renamed memory {} to {}", args.old_key, args.new_key);
         }
+        Command::Lifecycle(args) => match args.command {
+            LifecycleCommand::Move(args) => {
+                let store = PolarisStore::from_current_dir()?;
+                store.require_initialized()?;
+                validate_lifecycle_move_args(&args)?;
+                let report = store.move_lifecycle(LifecycleMoveRequest {
+                    key: args.key,
+                    prefix: args.prefix,
+                    id: args.id,
+                    kind: args.kind,
+                    from: args.from,
+                    to: args.to,
+                })?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "Moved {} {}",
+                        report.moved.len(),
+                        memory_word(report.moved.len())
+                    );
+                    for moved in report.moved {
+                        let label = moved
+                            .key
+                            .or(moved.title)
+                            .or(moved.path)
+                            .unwrap_or_else(|| moved.id.clone());
+                        println!(
+                            "- {} {label}: {} -> {}",
+                            moved.id, moved.previous_lifecycle, moved.new_lifecycle
+                        );
+                    }
+                    if !report.skipped.is_empty() {
+                        println!(
+                            "Skipped {} {}",
+                            report.skipped.len(),
+                            memory_word(report.skipped.len())
+                        );
+                        for skipped in report.skipped {
+                            let label = skipped
+                                .key
+                                .or(skipped.title)
+                                .or(skipped.path)
+                                .unwrap_or_else(|| skipped.id.clone());
+                            println!("- {} {label}: {}", skipped.id, skipped.reason);
+                        }
+                    }
+                }
+            }
+        },
+        Command::Diff(args) => {
+            let store = PolarisStore::from_current_dir()?;
+            store.require_initialized()?;
+            match store.diff_key(&args.key)? {
+                DiffResult::Available(diff) => {
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&diff)?);
+                    } else {
+                        println!("Diff for memory {}", diff.key);
+                        print!("{}", diff.diff);
+                    }
+                }
+                DiffResult::NoSnapshot { key } => {
+                    if args.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "key": key,
+                                "available": false,
+                                "message": format!("No replacement snapshot is available for {key}")
+                            }))?
+                        );
+                    } else {
+                        println!("No replacement snapshot is available for {key}");
+                    }
+                }
+            }
+        }
         Command::Merge(args) => {
             let store = PolarisStore::from_current_dir()?;
             store.require_initialized()?;
@@ -392,4 +514,44 @@ pub fn run() -> Result<()> {
         },
     }
     Ok(())
+}
+
+fn validate_lifecycle_move_args(args: &LifecycleMoveArgs) -> Result<()> {
+    let selectors = [
+        args.key.is_some(),
+        args.prefix.is_some(),
+        args.id.is_some(),
+        args.kind.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+
+    if selectors == 0 {
+        return Err(anyhow!(
+            "lifecycle move requires exactly one selector: --key, --prefix, --id, or --kind"
+        ));
+    }
+    if selectors > 1 {
+        return Err(anyhow!(
+            "lifecycle move selectors conflict; use exactly one of --key, --prefix, --id, or --kind"
+        ));
+    }
+
+    if args.key.as_deref().is_some_and(str::is_empty)
+        || args.prefix.as_deref().is_some_and(str::is_empty)
+        || args.id.as_deref().is_some_and(str::is_empty)
+    {
+        return Err(anyhow!("lifecycle move selector values must not be empty"));
+    }
+
+    if (args.prefix.is_some() || args.kind.is_some()) && !args.yes {
+        return Err(anyhow!("batch lifecycle moves require --yes"));
+    }
+
+    Ok(())
+}
+
+fn memory_word(count: usize) -> &'static str {
+    if count == 1 { "memory" } else { "memories" }
 }

@@ -13,6 +13,7 @@ const STATE_FILE: &str = "state.json";
 const HOOK_STATE_FILE: &str = "hook-state.json";
 const CONFIG_FILE: &str = "config.toml";
 const MEMORIES_FILE: &str = "memories.jsonl";
+const REPLACEMENT_HISTORY_FILE: &str = "replacement-history.jsonl";
 const MEMORIES_LOCK_FILE: &str = "memories.lock";
 const DOCS_DIR: &str = "docs";
 const MAINTENANCE_DIR: &str = "maintenance";
@@ -101,7 +102,7 @@ pub struct MemoryRecord {
     pub path: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryKind {
     Inline,
@@ -242,6 +243,62 @@ pub struct SuggestionPromptContext {
     keys: Vec<String>,
 }
 
+pub struct LifecycleMoveRequest {
+    pub key: Option<String>,
+    pub prefix: Option<String>,
+    pub id: Option<String>,
+    pub kind: Option<MemoryKind>,
+    pub from: Option<MemoryLifecycle>,
+    pub to: MemoryLifecycle,
+}
+
+#[derive(Serialize)]
+pub struct LifecycleMoveReport {
+    pub moved: Vec<LifecycleMoveRecord>,
+    pub skipped: Vec<LifecycleMoveSkippedRecord>,
+}
+
+#[derive(Serialize)]
+pub struct LifecycleMoveRecord {
+    pub id: String,
+    pub kind: MemoryKind,
+    pub previous_lifecycle: MemoryLifecycle,
+    pub new_lifecycle: MemoryLifecycle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct LifecycleMoveSkippedRecord {
+    pub id: String,
+    pub kind: MemoryKind,
+    pub lifecycle: MemoryLifecycle,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ReplacementDiff {
+    pub key: String,
+    pub current_id: String,
+    pub previous_id: String,
+    pub diff: String,
+}
+
+pub enum DiffResult {
+    Available(ReplacementDiff),
+    NoSnapshot { key: String },
+}
+
 enum MaintenancePromptKind {
     Prune,
     Compact,
@@ -344,15 +401,17 @@ impl PolarisStore {
                     input.key
                 ));
             }
+            let previous = existing.clone();
             record.created_at = existing.created_at;
             record.updated_at = Some(now);
             record.lifecycle = input.lifecycle.or(existing.lifecycle);
             record.replacement_count = Some(existing.replacement_count.unwrap_or(0) + 1);
             record.replaced_from = Some(existing.id);
+            self.append_replacement_history(&previous)?;
             records.retain(|record| !record.is_inline_key(&input.key));
-            records.push(record);
+            records.push(record.clone());
             self.write_records(&records)?;
-            Ok(records.pop().expect("record was just pushed"))
+            Ok(record)
         } else {
             self.append_record(&record)?;
             Ok(record)
@@ -559,6 +618,7 @@ impl PolarisStore {
             path: None,
         };
         if let Some(existing) = existing {
+            self.append_replacement_history(&existing)?;
             target_record.created_at = existing.created_at;
             target_record.updated_at = Some(now);
             target_record.lifecycle = existing.lifecycle;
@@ -577,6 +637,87 @@ impl PolarisStore {
         records.push(target_record);
         self.write_records(&records)?;
         Ok(draft.target)
+    }
+
+    pub fn move_lifecycle(&self, request: LifecycleMoveRequest) -> Result<LifecycleMoveReport> {
+        let _lock = self.lock_memories_exclusive()?;
+        let mut records = self.load_records_unlocked()?;
+        let mut moved = Vec::new();
+        let mut skipped = Vec::new();
+        let updated_at = now();
+
+        for record in &mut records {
+            if !record.matches_lifecycle_move_selector(&request) {
+                continue;
+            }
+
+            let previous_lifecycle = record.effective_lifecycle();
+            if let Some(from) = request.from
+                && previous_lifecycle != from
+            {
+                skipped.push(
+                    record.lifecycle_skipped_record(previous_lifecycle, "from lifecycle mismatch"),
+                );
+                continue;
+            }
+            if previous_lifecycle == request.to {
+                skipped.push(
+                    record.lifecycle_skipped_record(
+                        previous_lifecycle,
+                        "already at target lifecycle",
+                    ),
+                );
+                continue;
+            }
+
+            record.lifecycle = Some(request.to);
+            record.updated_at = Some(updated_at.clone());
+            moved.push(record.lifecycle_move_record(previous_lifecycle, request.to));
+        }
+
+        if moved.is_empty() && skipped.is_empty() {
+            return Err(anyhow!("No memory records matched lifecycle move selector"));
+        }
+
+        if !moved.is_empty() {
+            self.write_records(&records)?;
+        }
+
+        Ok(LifecycleMoveReport { moved, skipped })
+    }
+
+    pub fn diff_key(&self, key: &str) -> Result<DiffResult> {
+        let _lock = self.lock_memories_shared()?;
+        let records = self.load_records_unlocked()?;
+        let current = records
+            .iter()
+            .find(|record| record.is_inline_key(key))
+            .ok_or_else(|| anyhow!("No memory exists for key `{key}`"))?;
+
+        let Some(previous_id) = current.replaced_from.as_deref() else {
+            return Ok(DiffResult::NoSnapshot {
+                key: key.to_string(),
+            });
+        };
+
+        let history = self.load_replacement_history_unlocked()?;
+        let Some(previous) = history.iter().rev().find(|record| record.id == previous_id) else {
+            return Ok(DiffResult::NoSnapshot {
+                key: key.to_string(),
+            });
+        };
+
+        Ok(DiffResult::Available(ReplacementDiff {
+            key: key.to_string(),
+            current_id: current.id.clone(),
+            previous_id: previous.id.clone(),
+            diff: unified_diff(
+                "previous",
+                previous.text.as_deref().unwrap_or(""),
+                "current",
+                current.text.as_deref().unwrap_or(""),
+            ),
+        }))
     }
 
     pub fn recall(&self) -> Result<String> {
@@ -822,13 +963,46 @@ impl PolarisStore {
         Ok(records)
     }
 
+    fn load_replacement_history_unlocked(&self) -> Result<Vec<MemoryRecord>> {
+        let history_file = self.replacement_history_file();
+        if !history_file.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&history_file)
+            .with_context(|| format!("failed to open {}", history_file.display()))?;
+        let mut records = Vec::new();
+        for (index, line) in BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            records.push(serde_json::from_str(&line).map_err(|error| {
+                anyhow!(
+                    "failed to parse {}:{}: {}",
+                    history_file.display(),
+                    index + 1,
+                    error
+                )
+            })?);
+        }
+        Ok(records)
+    }
+
     fn append_record(&self, record: &MemoryRecord) -> Result<()> {
+        self.append_jsonl_record(&self.memories_file(), record)
+    }
+
+    fn append_replacement_history(&self, record: &MemoryRecord) -> Result<()> {
+        self.append_jsonl_record(&self.replacement_history_file(), record)
+    }
+
+    fn append_jsonl_record(&self, path: &Path, record: &MemoryRecord) -> Result<()> {
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(self.memories_file())
-            .with_context(|| format!("failed to open {}", self.memories_file().display()))?;
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
 
         let len = file.metadata()?.len();
         if len > 0 {
@@ -880,6 +1054,10 @@ impl PolarisStore {
 
     fn memories_file(&self) -> PathBuf {
         self.root().join(MEMORIES_FILE)
+    }
+
+    fn replacement_history_file(&self) -> PathBuf {
+        self.root().join(REPLACEMENT_HISTORY_FILE)
     }
 
     fn memories_lock_file(&self) -> PathBuf {
@@ -945,6 +1123,54 @@ impl MemoryRecord {
 
         true
     }
+
+    fn matches_lifecycle_move_selector(&self, request: &LifecycleMoveRequest) -> bool {
+        if let Some(key) = request.key.as_deref() {
+            return self.is_inline_key(key);
+        }
+        if let Some(prefix) = request.prefix.as_deref() {
+            return self.is_inline_key_prefix(prefix);
+        }
+        if let Some(id) = request.id.as_deref() {
+            return self.id == id;
+        }
+        if let Some(kind) = request.kind {
+            return self.kind == kind;
+        }
+        false
+    }
+
+    fn lifecycle_move_record(
+        &self,
+        previous_lifecycle: MemoryLifecycle,
+        new_lifecycle: MemoryLifecycle,
+    ) -> LifecycleMoveRecord {
+        LifecycleMoveRecord {
+            id: self.id.clone(),
+            kind: self.kind,
+            previous_lifecycle,
+            new_lifecycle,
+            key: self.key.clone(),
+            title: self.title.clone(),
+            path: self.path.clone(),
+        }
+    }
+
+    fn lifecycle_skipped_record(
+        &self,
+        lifecycle: MemoryLifecycle,
+        reason: &str,
+    ) -> LifecycleMoveSkippedRecord {
+        LifecycleMoveSkippedRecord {
+            id: self.id.clone(),
+            kind: self.kind,
+            lifecycle,
+            reason: reason.to_string(),
+            key: self.key.clone(),
+            title: self.title.clone(),
+            path: self.path.clone(),
+        }
+    }
 }
 
 impl MemoryFilter {
@@ -974,6 +1200,33 @@ impl From<MemoryRecord> for MemorySummary {
     }
 }
 
+impl MemoryKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Note => "note",
+        }
+    }
+}
+
+impl std::fmt::Display for MemoryKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MemoryKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "inline" => Ok(Self::Inline),
+            "note" => Ok(Self::Note),
+            _ => Err("supported memory kinds are inline and note".to_string()),
+        }
+    }
+}
+
 impl MemoryLifecycle {
     fn as_str(self) -> &'static str {
         match self {
@@ -987,6 +1240,35 @@ impl MemoryLifecycle {
     fn all() -> [Self; 4] {
         [Self::Durable, Self::State, Self::Log, Self::Archive]
     }
+}
+
+fn unified_diff(
+    previous_label: &str,
+    previous: &str,
+    current_label: &str,
+    current: &str,
+) -> String {
+    let previous_lines = previous.lines().collect::<Vec<_>>();
+    let current_lines = current.lines().collect::<Vec<_>>();
+    let max_len = previous_lines.len().max(current_lines.len());
+    let mut output = format!("--- {previous_label}\n+++ {current_label}\n");
+
+    for index in 0..max_len {
+        match (previous_lines.get(index), current_lines.get(index)) {
+            (Some(previous), Some(current)) if previous == current => {
+                output.push_str(&format!(" {previous}\n"));
+            }
+            (Some(previous), Some(current)) => {
+                output.push_str(&format!("-{previous}\n"));
+                output.push_str(&format!("+{current}\n"));
+            }
+            (Some(previous), None) => output.push_str(&format!("-{previous}\n")),
+            (None, Some(current)) => output.push_str(&format!("+{current}\n")),
+            (None, None) => {}
+        }
+    }
+
+    output
 }
 
 impl std::fmt::Display for MemoryLifecycle {

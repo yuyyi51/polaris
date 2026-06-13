@@ -11,6 +11,12 @@ polaris remember --key goal --text "task goal" --title "Goal"
 polaris remember --key decision --stdin --title "Decision" --lifecycle durable
 polaris remember --key state.branch --text "working on filters" --lifecycle state
 polaris remember --key goal --replace --text "updated task goal"
+polaris diff --key goal
+polaris diff --key goal --json
+polaris lifecycle move --key state.branch --to state
+polaris lifecycle move --prefix state. --from durable --to state --yes
+polaris lifecycle move --id <record-id> --to archive
+polaris lifecycle move --kind note --from log --to archive --yes
 polaris rename old.key new.key
 polaris forget goal
 polaris forget goal plan
@@ -46,7 +52,28 @@ Memory records may include lifecycle metadata:
 - `log`: short work logs and handoff breadcrumbs.
 - `archive`: historical context that should stay available but is not normally recalled.
 
-Use `--lifecycle <durable|state|log|archive>` with `polaris remember` or `polaris note create`. Replacing a keyed inline memory preserves its existing lifecycle unless a new `--lifecycle` is provided. Replacement summaries include `updated_at`, `replacement_count`, and `replaced_from`.
+Use `--lifecycle <durable|state|log|archive>` with `polaris remember` or `polaris note create`. Replacing a keyed inline memory preserves its existing lifecycle unless a new `--lifecycle` is provided. Replacement summaries include `updated_at`, `replacement_count`, and `replaced_from`. Polaris also saves the previous active inline record to `.polaris/replacement-history.jsonl` for later diff review.
+
+Use `polaris lifecycle move` to reclassify existing memory without rewriting memory text or note files:
+
+```bash
+polaris lifecycle move --key state.branch --to state
+polaris lifecycle move --prefix state. --from durable --to state --yes
+polaris lifecycle move --id <record-id> --to archive
+polaris lifecycle move --kind note --from log --to archive --yes
+polaris lifecycle move --prefix state. --to state --yes --json
+```
+
+Single-record moves selected by `--key` or `--id` do not require confirmation. Batch moves selected by `--prefix` or `--kind` require `--yes`. Notes are selected by record id or kind; note title matching is intentionally unsupported.
+
+Use `polaris diff --key <key>` after `remember --replace` to review what changed in the latest replacement:
+
+```bash
+polaris diff --key goal
+polaris diff --key goal --json
+```
+
+Diff compares the current active keyed inline memory with the latest saved replacement snapshot. Existing records replaced before replacement history existed remain valid, but `diff --key` reports that no snapshot is available for those keys.
 
 Use `polaris list --keys` for one key per line, or `polaris list --json` for machine-readable record summaries without inline memory text. Add `--lifecycle <value>` to `polaris list --json` to inspect one lifecycle. Use `polaris recall --key <key>`, `polaris recall --prefix <prefix>`, `polaris recall --exclude <prefix>`, or `polaris recall --lifecycle <value>` to recover only relevant context. Lifecycle recall composes with exact key, prefix, and exclude-prefix filters.
 
@@ -65,6 +92,8 @@ polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes
 Add `--forget-sources` to remove the source keyed inline memories in the same confirmed apply operation. Invalid drafts and unconfirmed apply commands leave active memory unchanged.
 
 Use `polaris prune --suggest` and `polaris compact --suggest` to inspect deterministic maintenance suggestions without mutating memory. Prune suggestions flag old volatile records, duplicate exact text, and replacement metadata. Compact suggestions flag shared key prefixes and related lifecycle groups. Both commands include an agent review prompt by default so the caller can inspect candidates before taking action.
+
+For a copyable safe-edit workflow that combines lifecycle moves and replacement diffs, see `examples/polaris-maintenance/edit-review.md`.
 
 With `--json`, suggest commands return an envelope:
 

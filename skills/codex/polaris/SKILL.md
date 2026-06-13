@@ -69,6 +69,21 @@ Rename a keyed inline memory when the key changed but the content is still corre
 polaris rename old.key new.key
 ```
 
+Move lifecycle metadata when the record is useful but mislabeled. Use exact selectors for one record and confirmed batch selectors for groups:
+
+```bash
+polaris lifecycle move --key state.branch --to state
+polaris lifecycle move --prefix state. --from durable --to state --yes
+polaris lifecycle move --id <record-id> --to archive
+polaris lifecycle move --kind note --from log --to archive --yes
+```
+
+Use `--json` when you need machine-readable moved and skipped records:
+
+```bash
+polaris lifecycle move --prefix state. --to state --yes --json
+```
+
 Create a merge draft when several keyed memories should become one durable summary:
 
 ```bash
@@ -144,6 +159,15 @@ Use stable keys such as `goal`, `plan`, `decision.storage`, `blocker`, and `veri
 ```bash
 polaris remember --key goal --replace --text "Implement keyed memory replacement and forgetting." --lifecycle durable
 ```
+
+After replacing important durable memory, review the latest change before relying on it:
+
+```bash
+polaris diff --key goal
+polaris diff --key goal --json
+```
+
+If no replacement snapshot is available, treat that as a normal legacy condition and inspect the current memory with `polaris recall --key <key>`.
 
 For long context, create a note and write details to the returned path:
 
