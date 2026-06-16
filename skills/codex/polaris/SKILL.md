@@ -97,6 +97,17 @@ polaris touch --keys state.branch,missing --json
 
 Use exact keys or ids for small updates. Prefix touch requires `--yes` because it can affect many records.
 
+Keep recall, freshness, and citation separate: recall shows stored context, touch marks records as still fresh, and cite marks records the agent explicitly used as evidence.
+
+```bash
+polaris cite --key goal
+polaris cite --keys goal,decision.product_model --quiet
+polaris cite --id <record-id>
+polaris cite --ids <record-id>,<record-id> --quiet
+```
+
+Do not cite every recalled record. Cite only memories that actually affected reasoning, avoided repeated investigation, corrected an assumption, or shaped a decision. Prefer batching citations with nearby Polaris or shell work using `--keys`, `--ids`, and `--quiet`; for example, run `polaris cite --keys goal,decision.product_model --quiet` in the same tool call as the next natural checkpoint when practical.
+
 Create a merge draft when several keyed memories should become one durable summary:
 
 ```bash
@@ -126,6 +137,8 @@ polaris compact --suggest --json
 
 Treat suggestions as advisory. Each suggest command includes an agent review prompt by default; read and follow that prompt before taking action. Do not delete or merge memory solely because Polaris suggested it; check the affected keys first with `polaris recall --key` or `polaris recall --prefix`.
 
+Citation counts and memory creation time are advisory context for review. Do not forget, keep, or merge memories solely because of citation counts.
+
 When using JSON output, read the response envelope:
 
 ```json
@@ -134,7 +147,8 @@ When using JSON output, read the response envelope:
   "prompt": "...",
   "prompt_context": {
     "status": {},
-    "keys": []
+    "keys": [],
+    "citation_summaries": []
   }
 }
 ```

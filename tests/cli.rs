@@ -1936,6 +1936,475 @@ fn touch_rejects_conflicting_selectors_and_reports_json() {
 }
 
 #[test]
+fn cite_records_by_key_id_and_multi_selectors_without_mutating_memory() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--text",
+            "goal text",
+            "--title",
+            "Goal",
+            "--lifecycle",
+            "state",
+        ])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "plan", "--text", "plan text"])
+        .assert()
+        .success();
+    let before = fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap();
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 2);
+    let goal_id = records
+        .iter()
+        .find(|record| record["key"] == "goal")
+        .expect("goal")["id"]
+        .as_str()
+        .expect("goal id")
+        .to_string();
+    let plan_id = records
+        .iter()
+        .find(|record| record["key"] == "plan")
+        .expect("plan")["id"]
+        .as_str()
+        .expect("plan id")
+        .to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "goal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cited 1 memory"))
+        .stdout(predicate::str::contains("goal"));
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--id", &plan_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&plan_id));
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--keys", "goal,missing", "--quiet"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("Missing keys: missing"));
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".polaris/memories.jsonl")).unwrap(),
+        before
+    );
+
+    let citations = assert_jsonl_records(&dir.path().join(".polaris/citations.jsonl"), 3);
+    assert_eq!(citations[0]["record_id"], goal_id);
+    assert_eq!(citations[0]["key"], "goal");
+    assert_eq!(citations[0]["title"], "Goal");
+    assert_eq!(citations[0]["kind"], "inline");
+    assert_eq!(citations[0]["record_created_at"], records[0]["created_at"]);
+    assert!(citations[0]["cited_at"].as_str().is_some());
+}
+
+#[test]
+fn cite_rejects_invalid_selectors_and_no_match_commands() {
+    let dir = temp_workspace();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "goal"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("polaris init"));
+
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "goal text"])
+        .assert()
+        .success();
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    let goal_id = records[0]["id"].as_str().expect("goal id").to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "goal", "--id", &goal_id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("selectors conflict"));
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No memory exists for key `missing`",
+        ));
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--keys", "missing,absent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No requested memory records were cited",
+        ));
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--prefix", "decision."])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--prefix"));
+
+    assert_jsonl_records_if_exists(&dir.path().join(".polaris/citations.jsonl"), 0);
+}
+
+#[test]
+fn list_json_reports_direct_citation_metadata_and_empty_history() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "goal text"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "plan", "--text", "plan text"])
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    let summaries = summaries.as_array().expect("summaries");
+    assert!(summaries.iter().all(|summary| {
+        summary["direct_cite_count"] == 0 && summary["inherited_cite_count"] == 0
+    }));
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "goal"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "goal"])
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    let summaries = summaries.as_array().expect("summaries");
+    let goal = summaries
+        .iter()
+        .find(|summary| summary["key"] == "goal")
+        .expect("goal summary");
+    let plan = summaries
+        .iter()
+        .find(|summary| summary["key"] == "plan")
+        .expect("plan summary");
+    assert_eq!(goal["direct_cite_count"], 2);
+    assert_eq!(goal["inherited_cite_count"], 0);
+    assert!(goal["last_cited_at"].as_str().is_some());
+    assert!(goal["created_at"].as_str().is_some());
+    assert_eq!(plan["direct_cite_count"], 0);
+    assert_eq!(plan["inherited_cite_count"], 0);
+}
+
+#[test]
+fn citation_lineage_separates_inherited_and_direct_counts() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "goal", "--text", "old goal"])
+        .assert()
+        .success();
+    let before_replace = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    let old_goal_id = before_replace[0]["id"]
+        .as_str()
+        .expect("old id")
+        .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "goal"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "goal"])
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--replace",
+            "--text",
+            "new goal",
+        ])
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    let goal = summaries
+        .as_array()
+        .expect("summaries")
+        .iter()
+        .find(|summary| summary["key"] == "goal")
+        .expect("goal summary");
+    assert_eq!(goal["direct_cite_count"], 0);
+    assert_eq!(goal["inherited_cite_count"], 2);
+    assert!(
+        goal["citation_source_ids"]
+            .as_array()
+            .expect("source ids")
+            .iter()
+            .any(|source| source == &old_goal_id)
+    );
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "goal"])
+        .assert()
+        .success();
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    let goal = summaries
+        .as_array()
+        .expect("summaries")
+        .iter()
+        .find(|summary| summary["key"] == "goal")
+        .expect("goal summary");
+    assert_eq!(goal["direct_cite_count"], 1);
+    assert_eq!(goal["inherited_cite_count"], 2);
+}
+
+#[test]
+fn merge_citation_lineage_inherits_source_counts_without_double_counting() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "keyA", "--text", "old alpha"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "keyA"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "keyA"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args([
+            "remember",
+            "--key",
+            "keyA",
+            "--replace",
+            "--text",
+            "new alpha",
+        ])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .args(["cite", "--key", "keyA"])
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .args(["remember", "--key", "keyB", "--text", "beta"])
+        .assert()
+        .success();
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["merge", "--into", "keyB", "keyA"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    let key_b_draft = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Path: "))
+        .expect("keyB draft");
+    fs::write(
+        dir.path().join(key_b_draft),
+        "<!-- polaris-merge-draft-v1\ntarget: keyB\nsources: keyA\n-->\n\n# Polaris Merge Draft\n\n## Merged Memory\n\nbeta summary\n",
+    )
+    .expect("edit keyB draft");
+    polaris()
+        .current_dir(dir.path())
+        .args(["merge", "apply", key_b_draft, "--yes"])
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["merge", "--into", "model.summary", "keyA", "keyB"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    let summary_draft = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Path: "))
+        .expect("summary draft");
+    fs::write(
+        dir.path().join(summary_draft),
+        "<!-- polaris-merge-draft-v1\ntarget: model.summary\nsources: keyA,keyB\n-->\n\n# Polaris Merge Draft\n\n## Merged Memory\n\nmerged summary\n",
+    )
+    .expect("edit summary draft");
+    polaris()
+        .current_dir(dir.path())
+        .args(["merge", "apply", summary_draft, "--yes", "--forget-sources"])
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let summaries: Value = serde_json::from_slice(&output).expect("list json");
+    let summary = summaries
+        .as_array()
+        .expect("summaries")
+        .iter()
+        .find(|summary| summary["key"] == "model.summary")
+        .expect("model summary");
+    assert_eq!(summary["direct_cite_count"], 0);
+    assert_eq!(summary["inherited_cite_count"], 3);
+    let source_ids = summary["citation_source_ids"]
+        .as_array()
+        .expect("source ids");
+    let unique = source_ids
+        .iter()
+        .map(|source| source.as_str().expect("source id"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(source_ids.len(), unique.len());
+}
+
+#[test]
+fn citation_jsonl_diagnostics_and_concurrent_recording_are_stable() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    for key in ["one", "two", "three"] {
+        polaris()
+            .current_dir(dir.path())
+            .args(["remember", "--key", key, "--text", key])
+            .assert()
+            .success();
+    }
+
+    run_parallel_remember_commands(
+        dir.path(),
+        vec![
+            vec![
+                "cite".to_string(),
+                "--key".to_string(),
+                "one".to_string(),
+                "--quiet".to_string(),
+            ],
+            vec![
+                "cite".to_string(),
+                "--key".to_string(),
+                "two".to_string(),
+                "--quiet".to_string(),
+            ],
+            vec![
+                "cite".to_string(),
+                "--key".to_string(),
+                "three".to_string(),
+                "--quiet".to_string(),
+            ],
+        ],
+    );
+    assert_jsonl_records(&dir.path().join(".polaris/citations.jsonl"), 3);
+    polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success();
+
+    let mut citations = fs::read_to_string(dir.path().join(".polaris/citations.jsonl")).unwrap();
+    citations.push_str("\n   \n");
+    fs::write(dir.path().join(".polaris/citations.jsonl"), citations).unwrap();
+    polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .success();
+
+    fs::write(
+        dir.path().join(".polaris/citations.jsonl"),
+        "{\"id\":\"good\",\"record_id\":\"one\",\"cited_at\":\"2026-06-16T00:00:00Z\",\"kind\":\"inline\",\"record_created_at\":\"2026-06-16T00:00:00Z\"}\nnot json\n",
+    )
+    .unwrap();
+    polaris()
+        .current_dir(dir.path())
+        .args(["list", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(".polaris/citations.jsonl"))
+        .stderr(predicate::str::contains(":2:"))
+        .stderr(predicate::str::contains("expected"));
+}
+
+#[test]
 fn rename_changes_key_and_preserves_memory_text_and_metadata() {
     let dir = temp_workspace();
     init_workspace(dir.path());
@@ -2350,6 +2819,16 @@ fn prune_suggest_reports_human_json_and_no_suggestions_without_mutating() {
             .iter()
             .any(|key| key == "state.branch")
     );
+    assert!(
+        response["prompt_context"]["citation_summaries"]
+            .as_array()
+            .expect("citation summaries")
+            .iter()
+            .any(|summary| summary["key"] == "state.branch"
+                && summary["created_at"] == "2026-05-01T00:00:00Z"
+                && summary["direct_cite_count"] == 0
+                && summary["inherited_cite_count"] == 0)
+    );
 
     let clean = temp_workspace();
     init_workspace(clean.path());
@@ -2437,6 +2916,15 @@ fn compact_suggest_reports_human_json_and_no_suggestions_without_mutating() {
     );
     assert_eq!(response["prompt_context"]["status"]["memory_count"], 3);
     assert!(
+        response["prompt_context"]["citation_summaries"]
+            .as_array()
+            .expect("citation summaries")
+            .iter()
+            .any(|summary| summary["key"] == "decision.storage"
+                && summary["direct_cite_count"] == 0
+                && summary["inherited_cite_count"] == 0)
+    );
+    assert!(
         response["prompt_context"]["keys"]
             .as_array()
             .expect("keys")
@@ -2460,6 +2948,25 @@ fn compact_suggest_reports_human_json_and_no_suggestions_without_mutating() {
             "No compact suggestions are available",
         ))
         .stdout(predicate::str::contains("Agent prompt:"));
+}
+
+#[test]
+fn documentation_and_skill_explain_citation_semantics_and_batching() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = fs::read_to_string(manifest.join("README.md")).expect("read README");
+    let skill = fs::read_to_string(manifest.join("skills/codex/polaris/SKILL.md"))
+        .expect("read bundled skill");
+
+    for content in [&readme, &skill] {
+        assert!(content.contains("polaris cite --key"));
+        assert!(content.contains("polaris cite --keys"));
+        assert!(content.contains("recall shows"));
+        assert!(content.contains("touch marks"));
+        assert!(content.contains("cite marks"));
+        assert!(content.contains("Do not cite every recalled"));
+        assert!(content.contains("--quiet"));
+        assert!(content.contains("advisory"));
+    }
 }
 
 #[test]

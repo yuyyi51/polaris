@@ -20,6 +20,10 @@ polaris touch --keys state.branch,state.queue
 polaris touch --id <record-id>
 polaris touch --prefix state. --yes
 polaris touch --keys state.branch,missing --json
+polaris cite --key goal
+polaris cite --keys goal,decision.product_model --quiet
+polaris cite --id <record-id>
+polaris cite --ids <record-id>,<record-id> --quiet
 polaris lifecycle move --key state.branch --to state
 polaris lifecycle move --prefix state. --from durable --to state --yes
 polaris lifecycle move --id <record-id> --to archive
@@ -104,6 +108,19 @@ polaris touch --keys state.branch,missing --json
 
 Exact key, multi-key, and id selectors do not require confirmation. Prefix touch requires `--yes` because it can update many records. JSON output reports touched records, missing keys, and skipped records.
 
+Polaris keeps recall, freshness, and citation separate: recall shows stored context, touch marks records as still fresh, and cite marks records an agent explicitly used as evidence.
+
+Use `polaris cite` sparingly when a memory actually affected reasoning, avoided repeated investigation, corrected an assumption, or shaped a decision:
+
+```bash
+polaris cite --key goal
+polaris cite --keys goal,decision.product_model --quiet
+polaris cite --id 0123456789abcdef0123456789abcdef
+polaris cite --ids 0123456789abcdef0123456789abcdef,fedcba9876543210fedcba9876543210 --quiet
+```
+
+Do not cite every recalled record. Citation counts are advisory review context, not proof that a memory should be kept forever or that uncited memory should be removed. Use `--keys`, `--ids`, and `--quiet` to batch citation with nearby Polaris or shell work when practical.
+
 Use `polaris list --keys` for one key per line, or `polaris list --json` for machine-readable record summaries without inline memory text. Add `--lifecycle <value>` to `polaris list --json` to inspect one lifecycle. Use `polaris recall --key <key>`, `polaris recall --keys <key1,key2,...>`, `polaris recall --prefix <prefix>`, `polaris recall --exclude <prefix>`, or `polaris recall --lifecycle <value>` to recover only relevant context. Multi-key recall renders matching keys in request order and reports missing or filtered keys without failing. Lifecycle recall composes with exact key, multi-key, prefix, and exclude-prefix filters.
 
 `polaris status --json` includes lifecycle counts and advisory `stale_volatile_memory` hints for old `state` and `log` records. These hints are machine-readable and do not change command exit status.
@@ -132,7 +149,8 @@ With `--json`, suggest commands return an envelope:
   "prompt": "...",
   "prompt_context": {
     "status": {},
-    "keys": []
+    "keys": [],
+    "citation_summaries": []
   }
 }
 ```

@@ -1,7 +1,7 @@
 use crate::hook;
 use crate::storage::{
-    DiffResult, LifecycleMoveRequest, MemoryFilter, MemoryInput, MemoryKind, MemoryLifecycle,
-    PolarisStore, TouchRequest,
+    CiteRequest, DiffResult, LifecycleMoveRequest, MemoryFilter, MemoryInput, MemoryKind,
+    MemoryLifecycle, PolarisStore, TouchRequest,
 };
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
@@ -35,6 +35,7 @@ enum Command {
     Note(NoteArgs),
     Recall(RecallArgs),
     Touch(TouchArgs),
+    Cite(CiteArgs),
     Clear(ClearArgs),
     Hook(HookArgs),
 }
@@ -206,6 +207,20 @@ struct TouchArgs {
     yes: bool,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct CiteArgs {
+    #[arg(long)]
+    key: Option<String>,
+    #[arg(long)]
+    keys: Option<String>,
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long)]
+    ids: Option<String>,
+    #[arg(long)]
+    quiet: bool,
 }
 
 #[derive(Args)]
@@ -591,6 +606,49 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+        Command::Cite(args) => {
+            let store = PolarisStore::from_current_dir()?;
+            store.require_initialized()?;
+            validate_cite_args(&args)?;
+            let report = store.cite(CiteRequest {
+                key: args.key,
+                keys: args
+                    .keys
+                    .as_deref()
+                    .map(|keys| parse_csv_values(keys, "--keys"))
+                    .transpose()?
+                    .unwrap_or_default(),
+                id: args.id,
+                ids: args
+                    .ids
+                    .as_deref()
+                    .map(|ids| parse_csv_values(ids, "--ids"))
+                    .transpose()?
+                    .unwrap_or_default(),
+            })?;
+            if !args.quiet {
+                println!(
+                    "Cited {} {}",
+                    report.cited.len(),
+                    memory_word(report.cited.len())
+                );
+                for record in &report.cited {
+                    let label = record
+                        .key
+                        .clone()
+                        .or_else(|| record.title.clone())
+                        .or_else(|| record.path.clone())
+                        .unwrap_or_else(|| record.id.clone());
+                    println!("- {} {label}", record.id);
+                }
+            }
+            if !report.missing_keys.is_empty() {
+                eprintln!("Missing keys: {}", report.missing_keys.join(", "));
+            }
+            if !report.missing_ids.is_empty() {
+                eprintln!("Missing ids: {}", report.missing_ids.join(", "));
+            }
+        }
         Command::Clear(args) => {
             if !args.yes {
                 return Err(anyhow!("refusing to clear Polaris memory without --yes"));
@@ -697,6 +755,42 @@ fn validate_touch_args(args: &TouchArgs) -> Result<()> {
     }
     if args.prefix.is_some() && !args.yes {
         return Err(anyhow!("prefix touch requires --yes"));
+    }
+
+    Ok(())
+}
+
+fn validate_cite_args(args: &CiteArgs) -> Result<()> {
+    let selectors = [
+        args.key.is_some(),
+        args.keys.is_some(),
+        args.id.is_some(),
+        args.ids.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+
+    if selectors == 0 {
+        return Err(anyhow!(
+            "cite requires exactly one selector: --key, --keys, --id, or --ids"
+        ));
+    }
+    if selectors > 1 {
+        return Err(anyhow!(
+            "cite selectors conflict; use exactly one of --key, --keys, --id, or --ids"
+        ));
+    }
+    if args.key.as_deref().is_some_and(str::is_empty)
+        || args.id.as_deref().is_some_and(str::is_empty)
+    {
+        return Err(anyhow!("cite selector values must not be empty"));
+    }
+    if let Some(keys) = args.keys.as_deref() {
+        parse_csv_values(keys, "--keys")?;
+    }
+    if let Some(ids) = args.ids.as_deref() {
+        parse_csv_values(ids, "--ids")?;
     }
 
     Ok(())

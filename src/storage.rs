@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ const STATE_FILE: &str = "state.json";
 const HOOK_STATE_FILE: &str = "hook-state.json";
 const CONFIG_FILE: &str = "config.toml";
 const MEMORIES_FILE: &str = "memories.jsonl";
+const CITATIONS_FILE: &str = "citations.jsonl";
 const REPLACEMENT_HISTORY_FILE: &str = "replacement-history.jsonl";
 const MEMORIES_LOCK_FILE: &str = "memories.lock";
 const DOCS_DIR: &str = "docs";
@@ -31,6 +32,7 @@ Before removing any memory:
 4. Treat old `state` and `log` records as review candidates, not automatic deletion targets.
 5. Prefer `polaris rename`, `polaris remember --replace`, or lifecycle changes when the memory is useful but mislabeled.
 6. Only run `polaris forget <key>` when the memory is clearly stale, redundant, or misleading.
+7. Treat citation counts and memory creation time as advisory context only; never delete solely because a record has zero citations.
 
 Workspace status:
 {{status}}
@@ -51,6 +53,7 @@ Before merging any memory:
 5. Edit the draft so the merged memory is concise, accurate, and preserves important constraints.
 6. Apply with `polaris merge apply <draft> --yes`.
 7. Use `--forget-sources` only when the merged target fully supersedes every source key.
+8. Treat citation counts and memory creation time as advisory context only; never merge solely because records have citation metadata.
 
 Workspace status:
 {{status}}
@@ -92,6 +95,8 @@ pub struct MemoryRecord {
     pub replacement_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaced_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,6 +151,14 @@ pub struct MemorySummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     replaced_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    derived_from: Option<Vec<String>>,
+    direct_cite_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_cited_at: Option<String>,
+    inherited_cite_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    citation_source_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
@@ -179,6 +192,21 @@ struct MergeDraft {
 struct ReplacementDraft {
     target: String,
     text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CitationEvent {
+    pub id: String,
+    pub record_id: String,
+    pub cited_at: String,
+    pub kind: MemoryKind,
+    pub record_created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +281,21 @@ pub struct SuggestionResponse<T> {
 pub struct SuggestionPromptContext {
     status: Status,
     keys: Vec<String>,
+    citation_summaries: Vec<CitationSummary>,
+}
+
+#[derive(Serialize)]
+pub struct CitationSummary {
+    id: String,
+    created_at: String,
+    direct_cite_count: usize,
+    inherited_cite_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 pub struct LifecycleMoveRequest {
@@ -316,6 +359,40 @@ pub struct TouchRequest {
     pub keys: Vec<String>,
     pub id: Option<String>,
     pub prefix: Option<String>,
+}
+
+pub struct CiteRequest {
+    pub key: Option<String>,
+    pub keys: Vec<String>,
+    pub id: Option<String>,
+    pub ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct CiteReport {
+    pub cited: Vec<CitedRecord>,
+    pub missing_keys: Vec<String>,
+    pub missing_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct CitedRecord {
+    pub id: String,
+    pub kind: MemoryKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CitationStats {
+    direct_cite_count: usize,
+    last_cited_at: Option<String>,
+    inherited_cite_count: usize,
+    citation_source_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -436,6 +513,7 @@ impl PolarisStore {
             lifecycle: input.lifecycle,
             replacement_count: None,
             replaced_from: None,
+            derived_from: None,
             key: Some(input.key.clone()),
             title: input.title,
             text: Some(input.text),
@@ -459,7 +537,8 @@ impl PolarisStore {
             record.updated_at = Some(now);
             record.lifecycle = input.lifecycle.or(existing.lifecycle);
             record.replacement_count = Some(existing.replacement_count.unwrap_or(0) + 1);
-            record.replaced_from = Some(existing.id);
+            record.replaced_from = Some(existing.id.clone());
+            record.derived_from = Some(lineage_with_record(&previous));
             self.append_replacement_history(&previous)?;
             records.retain(|record| !record.is_inline_key(&input.key));
             records.push(record.clone());
@@ -576,6 +655,7 @@ impl PolarisStore {
             lifecycle,
             replacement_count: None,
             replaced_from: None,
+            derived_from: None,
             key: None,
             title: Some(title.to_string()),
             text: None,
@@ -725,6 +805,15 @@ impl PolarisStore {
             .iter()
             .find(|record| record.is_inline_key(&draft.target))
             .cloned();
+        let mut source_lineage = Vec::new();
+        for source in &draft.sources {
+            if let Some(record) = records.iter().find(|record| record.is_inline_key(source)) {
+                extend_unique(&mut source_lineage, record.id.clone());
+                for source_id in lineage_with_record(record) {
+                    extend_unique(&mut source_lineage, source_id);
+                }
+            }
+        }
         let mut target_record = MemoryRecord {
             id: new_id(),
             created_at: now.clone(),
@@ -733,6 +822,7 @@ impl PolarisStore {
             lifecycle: Some(MemoryLifecycle::Durable),
             replacement_count: None,
             replaced_from: None,
+            derived_from: None,
             key: Some(draft.target.clone()),
             title: None,
             text: Some(draft.text),
@@ -740,11 +830,18 @@ impl PolarisStore {
         };
         if let Some(existing) = existing {
             self.append_replacement_history(&existing)?;
+            extend_unique(&mut source_lineage, existing.id.clone());
+            for source_id in lineage_with_record(&existing) {
+                extend_unique(&mut source_lineage, source_id);
+            }
             target_record.created_at = existing.created_at;
             target_record.updated_at = Some(now);
             target_record.lifecycle = existing.lifecycle;
             target_record.replacement_count = Some(existing.replacement_count.unwrap_or(0) + 1);
             target_record.replaced_from = Some(existing.id);
+        }
+        if !source_lineage.is_empty() {
+            target_record.derived_from = Some(source_lineage);
         }
 
         records.retain(|record| {
@@ -894,6 +991,68 @@ impl PolarisStore {
         })
     }
 
+    pub fn cite(&self, request: CiteRequest) -> Result<CiteReport> {
+        let _lock = self.lock_memories_exclusive()?;
+        let records = self.load_records_unlocked()?;
+        let mut cited_records = Vec::new();
+        let mut missing_keys = Vec::new();
+        let mut missing_ids = Vec::new();
+
+        if let Some(key) = request.key.as_deref() {
+            let record = records
+                .iter()
+                .find(|record| record.is_inline_key(key))
+                .ok_or_else(|| anyhow!("No memory exists for key `{key}`"))?;
+            cited_records.push(record.clone());
+        } else if !request.keys.is_empty() {
+            for key in &request.keys {
+                if let Some(record) = records.iter().find(|record| record.is_inline_key(key)) {
+                    push_unique_record(&mut cited_records, record.clone());
+                } else {
+                    missing_keys.push(key.clone());
+                }
+            }
+        } else if let Some(id) = request.id.as_deref() {
+            let record = records
+                .iter()
+                .find(|record| record.id == id)
+                .ok_or_else(|| anyhow!("No memory exists for id `{id}`"))?;
+            cited_records.push(record.clone());
+        } else if !request.ids.is_empty() {
+            for id in &request.ids {
+                if let Some(record) = records.iter().find(|record| record.id == *id) {
+                    push_unique_record(&mut cited_records, record.clone());
+                } else {
+                    missing_ids.push(id.clone());
+                }
+            }
+        }
+
+        if cited_records.is_empty() {
+            return Err(anyhow!("No requested memory records were cited"));
+        }
+
+        let cited_at = now();
+        for record in &cited_records {
+            self.append_citation(&CitationEvent {
+                id: new_id(),
+                record_id: record.id.clone(),
+                cited_at: cited_at.clone(),
+                kind: record.kind,
+                record_created_at: record.created_at.clone(),
+                key: record.key.clone(),
+                title: record.title.clone(),
+                path: record.path.clone(),
+            })?;
+        }
+
+        Ok(CiteReport {
+            cited: cited_records.iter().map(CitedRecord::from).collect(),
+            missing_keys,
+            missing_ids,
+        })
+    }
+
     pub fn recall(&self) -> Result<String> {
         self.recall_filtered(&MemoryFilter::default())
     }
@@ -985,11 +1144,15 @@ impl PolarisStore {
     }
 
     pub fn list_summaries(&self, filter: &MemoryFilter) -> Result<Vec<MemorySummary>> {
-        Ok(self
-            .load_records()?
+        let records = self.load_records()?;
+        let citation_stats = self.citation_stats(&records)?;
+        Ok(records
             .into_iter()
             .filter(|record| record.matches_filter(filter))
-            .map(MemorySummary::from)
+            .map(|record| {
+                let stats = citation_stats.get(&record.id).cloned().unwrap_or_default();
+                MemorySummary::from_record(record, stats)
+            })
             .collect())
     }
 
@@ -1020,12 +1183,33 @@ impl PolarisStore {
     ) -> Result<SuggestionResponse<T>> {
         let status = self.status()?;
         let keys = self.list_keys(&MemoryFilter::default())?;
+        let records = self.load_records()?;
+        let citation_stats = self.citation_stats(&records)?;
+        let citation_summaries = records
+            .iter()
+            .map(|record| {
+                let stats = citation_stats.get(&record.id).cloned().unwrap_or_default();
+                CitationSummary {
+                    id: record.id.clone(),
+                    created_at: record.created_at.clone(),
+                    direct_cite_count: stats.direct_cite_count,
+                    inherited_cite_count: stats.inherited_cite_count,
+                    key: record.key.clone(),
+                    title: record.title.clone(),
+                    path: record.path.clone(),
+                }
+            })
+            .collect();
         let prompt = self.render_maintenance_prompt(&kind, &suggestions, &status, &keys)?;
 
         Ok(SuggestionResponse {
             suggestions,
             prompt,
-            prompt_context: SuggestionPromptContext { status, keys },
+            prompt_context: SuggestionPromptContext {
+                status,
+                keys,
+                citation_summaries,
+            },
         })
     }
 
@@ -1189,6 +1373,41 @@ impl PolarisStore {
         Ok(records)
     }
 
+    fn load_citations_unlocked(&self) -> Result<Vec<CitationEvent>> {
+        let citations_file = self.citations_file();
+        if !citations_file.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&citations_file)
+            .with_context(|| format!("failed to open {}", citations_file.display()))?;
+        let mut events = Vec::new();
+        for (index, line) in BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            events.push(serde_json::from_str(&line).map_err(|error| {
+                anyhow!(
+                    "failed to parse {}:{}: {}",
+                    citations_file.display(),
+                    index + 1,
+                    error
+                )
+            })?);
+        }
+        Ok(events)
+    }
+
+    fn citation_stats(
+        &self,
+        active_records: &[MemoryRecord],
+    ) -> Result<BTreeMap<String, CitationStats>> {
+        let _lock = self.lock_memories_shared()?;
+        let citations = self.load_citations_unlocked()?;
+        let history = self.load_replacement_history_unlocked()?;
+        Ok(citation_stats(active_records, &history, &citations))
+    }
+
     fn append_record(&self, record: &MemoryRecord) -> Result<()> {
         self.append_jsonl_record(&self.memories_file(), record)
     }
@@ -1197,7 +1416,11 @@ impl PolarisStore {
         self.append_jsonl_record(&self.replacement_history_file(), record)
     }
 
-    fn append_jsonl_record(&self, path: &Path, record: &MemoryRecord) -> Result<()> {
+    fn append_citation(&self, event: &CitationEvent) -> Result<()> {
+        self.append_jsonl_record(&self.citations_file(), event)
+    }
+
+    fn append_jsonl_record<T: Serialize>(&self, path: &Path, record: &T) -> Result<()> {
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -1259,6 +1482,10 @@ impl PolarisStore {
 
     fn replacement_history_file(&self) -> PathBuf {
         self.root().join(REPLACEMENT_HISTORY_FILE)
+    }
+
+    fn citations_file(&self) -> PathBuf {
+        self.root().join(CITATIONS_FILE)
     }
 
     fn memories_lock_file(&self) -> PathBuf {
@@ -1383,8 +1610,100 @@ impl MemoryFilter {
     }
 }
 
-impl From<MemoryRecord> for MemorySummary {
-    fn from(record: MemoryRecord) -> Self {
+fn citation_stats(
+    active_records: &[MemoryRecord],
+    history_records: &[MemoryRecord],
+    citations: &[CitationEvent],
+) -> BTreeMap<String, CitationStats> {
+    let mut citations_by_record: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for citation in citations {
+        citations_by_record
+            .entry(citation.record_id.clone())
+            .or_default()
+            .push(citation.cited_at.clone());
+    }
+
+    let mut records_by_id = BTreeMap::new();
+    for record in active_records.iter().chain(history_records.iter()) {
+        records_by_id.insert(record.id.clone(), record.clone());
+    }
+
+    let mut stats = BTreeMap::new();
+    for record in active_records {
+        let direct_times = citations_by_record
+            .get(&record.id)
+            .cloned()
+            .unwrap_or_default();
+        let mut source_ids = BTreeSet::new();
+        collect_lineage_ids(record, &records_by_id, &mut source_ids);
+
+        let mut inherited_cite_count = 0;
+        for source_id in &source_ids {
+            inherited_cite_count += citations_by_record
+                .get(source_id)
+                .map_or(0, std::vec::Vec::len);
+        }
+
+        stats.insert(
+            record.id.clone(),
+            CitationStats {
+                direct_cite_count: direct_times.len(),
+                last_cited_at: direct_times.into_iter().max(),
+                inherited_cite_count,
+                citation_source_ids: source_ids.into_iter().collect(),
+            },
+        );
+    }
+    stats
+}
+
+fn collect_lineage_ids(
+    record: &MemoryRecord,
+    records_by_id: &BTreeMap<String, MemoryRecord>,
+    source_ids: &mut BTreeSet<String>,
+) {
+    if let Some(replaced_from) = record.replaced_from.as_deref()
+        && source_ids.insert(replaced_from.to_string())
+        && let Some(source) = records_by_id.get(replaced_from)
+    {
+        collect_lineage_ids(source, records_by_id, source_ids);
+    }
+
+    for source_id in record.derived_from.iter().flatten() {
+        if source_ids.insert(source_id.clone())
+            && let Some(source) = records_by_id.get(source_id)
+        {
+            collect_lineage_ids(source, records_by_id, source_ids);
+        }
+    }
+}
+
+fn lineage_with_record(record: &MemoryRecord) -> Vec<String> {
+    let mut lineage = Vec::new();
+    extend_unique(&mut lineage, record.id.clone());
+    if let Some(replaced_from) = record.replaced_from.as_ref() {
+        extend_unique(&mut lineage, replaced_from.clone());
+    }
+    for source_id in record.derived_from.iter().flatten() {
+        extend_unique(&mut lineage, source_id.clone());
+    }
+    lineage
+}
+
+fn extend_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn push_unique_record(records: &mut Vec<MemoryRecord>, record: MemoryRecord) {
+    if !records.iter().any(|existing| existing.id == record.id) {
+        records.push(record);
+    }
+}
+
+impl MemorySummary {
+    fn from_record(record: MemoryRecord, stats: CitationStats) -> Self {
         let lifecycle = record.effective_lifecycle();
         Self {
             id: record.id,
@@ -1394,9 +1713,26 @@ impl From<MemoryRecord> for MemorySummary {
             lifecycle,
             replacement_count: record.replacement_count,
             replaced_from: record.replaced_from,
+            derived_from: record.derived_from,
+            direct_cite_count: stats.direct_cite_count,
+            last_cited_at: stats.last_cited_at,
+            inherited_cite_count: stats.inherited_cite_count,
+            citation_source_ids: stats.citation_source_ids,
             key: record.key,
             title: record.title,
             path: record.path,
+        }
+    }
+}
+
+impl From<&MemoryRecord> for CitedRecord {
+    fn from(record: &MemoryRecord) -> Self {
+        Self {
+            id: record.id.clone(),
+            kind: record.kind,
+            key: record.key.clone(),
+            title: record.title.clone(),
+            path: record.path.clone(),
         }
     }
 }
