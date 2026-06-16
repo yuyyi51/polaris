@@ -228,10 +228,24 @@ Using `{{recall}}` exposes `polaris recall` output to the agent context. Without
 
 ## Codex Skill
 
-This repository includes a copyable Codex skill at `skills/codex/polaris/`. To install it into a Codex environment, copy the folder into your skills directory:
+This repository includes a copyable Codex skill at `skills/codex/polaris/`. To install it into a Codex environment, run:
 
 ```bash
-cp -R skills/codex/polaris ~/.codex/skills/
+scripts/install-codex-skill.sh
+```
+
+The script installs the skill to `POLARIS_CODEX_SKILLS_DIR/polaris` when `POLARIS_CODEX_SKILLS_DIR` is set. Otherwise it uses `$CODEX_HOME/skills/polaris`; if `CODEX_HOME` is unset, it prefers an existing `$HOME/.codex-app/skills/polaris` and falls back to `$HOME/.codex/skills/polaris`.
+
+To install into a different skills directory, set `POLARIS_CODEX_SKILLS_DIR`:
+
+```bash
+POLARIS_CODEX_SKILLS_DIR=/path/to/skills scripts/install-codex-skill.sh
+```
+
+You can also copy the folder manually:
+
+```bash
+cp -R skills/codex/polaris "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
 
 The bundled skill is intentionally minimal. It only requires `SKILL.md`; it does not include or require `agents/openai.yaml`.

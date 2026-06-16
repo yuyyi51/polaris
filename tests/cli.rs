@@ -3268,3 +3268,76 @@ fn codex_fallback_hook_example_configures_post_compact_recall() {
         .expect("Polaris post-tool-use hook command exists");
     assert_eq!(post_tool_use_command["type"], "command");
 }
+
+#[test]
+fn install_codex_skill_script_uses_codex_home_by_default() {
+    let codex_home = temp_workspace();
+
+    run_install_skill_script([("CODEX_HOME", codex_home.path().to_str().unwrap())]);
+
+    let installed_skill = codex_home.path().join("skills/polaris/SKILL.md");
+    let bundled_skill = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/codex/polaris/SKILL.md");
+    assert_eq!(
+        fs::read_to_string(installed_skill).expect("installed SKILL.md"),
+        fs::read_to_string(bundled_skill).expect("bundled SKILL.md")
+    );
+}
+
+#[test]
+fn install_codex_skill_script_prefers_existing_codex_app_home() {
+    let home = temp_workspace();
+    fs::create_dir(home.path().join(".codex-app")).expect("create Codex app home");
+
+    run_install_skill_script([("HOME", home.path().to_str().unwrap())]);
+
+    let installed_skill = home.path().join(".codex-app/skills/polaris/SKILL.md");
+    let bundled_skill = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/codex/polaris/SKILL.md");
+    assert_eq!(
+        fs::read_to_string(installed_skill).expect("installed SKILL.md"),
+        fs::read_to_string(bundled_skill).expect("bundled SKILL.md")
+    );
+    assert!(!home.path().join("skills/polaris/SKILL.md").exists());
+}
+
+#[test]
+fn install_codex_skill_script_respects_override_and_replaces_existing_skill() {
+    let skills_dir = temp_workspace();
+    let stale_skill = skills_dir.path().join("polaris");
+    fs::create_dir_all(&stale_skill).expect("create stale skill dir");
+    fs::write(stale_skill.join("SKILL.md"), "stale skill").expect("write stale skill");
+    fs::write(stale_skill.join("local-only.txt"), "remove me").expect("write stale extra file");
+
+    run_install_skill_script([(
+        "POLARIS_CODEX_SKILLS_DIR",
+        skills_dir.path().to_str().unwrap(),
+    )]);
+
+    let installed_skill = skills_dir.path().join("polaris/SKILL.md");
+    let bundled_skill = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/codex/polaris/SKILL.md");
+    assert_eq!(
+        fs::read_to_string(installed_skill).expect("installed SKILL.md"),
+        fs::read_to_string(bundled_skill).expect("bundled SKILL.md")
+    );
+    assert!(!stale_skill.join("local-only.txt").exists());
+}
+
+fn run_install_skill_script<const N: usize>(envs: [(&str, &str); N]) {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = manifest_dir.join("scripts/install-codex-skill.sh");
+    let mut command = StdCommand::new(&script);
+    command
+        .current_dir(manifest_dir)
+        .env_remove("CODEX_HOME")
+        .env_remove("POLARIS_CODEX_SKILLS_DIR");
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    let output = command.output().expect("run install skill script");
+    assert!(
+        output.status.success(),
+        "install script failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
