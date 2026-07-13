@@ -12,7 +12,7 @@ polaris remember --key decision --stdin --title "Decision" --lifecycle durable
 polaris remember --key state.branch --text "working on filters" --lifecycle state
 polaris remember --key goal --replace --text "updated task goal"
 polaris remember --key goal --replace --dry-run --text "updated task goal"
-polaris replace apply .polaris/maintenance/replace-goal-<id>.md --yes
+polaris replace apply <draft-path-from-dry-run-output> --yes
 polaris diff --key goal
 polaris diff --key goal --json
 polaris touch --key state.branch
@@ -43,8 +43,8 @@ polaris recall --prefix decision.
 polaris recall --exclude state.
 polaris recall --lifecycle durable
 polaris merge --into decision.summary decision.storage decision.hooks
-polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes
-polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes --forget-sources
+polaris merge apply <merge-draft-path> --yes
+polaris merge apply <merge-draft-path> --yes --forget-sources
 polaris prune --suggest
 polaris prune --suggest --json
 polaris compact --suggest
@@ -54,6 +54,29 @@ polaris hook session-start
 polaris hook post-compact
 polaris hook post-tool-use
 ```
+
+## Storage Root
+
+By default Polaris stores every memory record, note, draft, citation, lock, and configuration file under `<process-cwd>/.polaris/`. Set the `POLARIS_ROOT` environment variable to select a different absolute directory. Every store-backed CLI command and every hook command picks up the same root, so an agent that runs `polaris recall` from a different working directory still reads and writes the same store.
+
+```bash
+export POLARIS_ROOT=/absolute/path/to/polaris-store
+polaris init
+polaris remember --key goal --text "task goal" --title "Goal"
+```
+
+Rules:
+
+- `POLARIS_ROOT` must be an **absolute path**. Polaris does not resolve relative values against the working directory; set `POLARIS_ROOT=$(pwd)/relative-target` if you need a path relative to the current shell.
+- An empty `POLARIS_ROOT` is rejected with a clear error before any store-backed command mutates data.
+- The selected root is used as-is. Polaris does not append another `.polaris` component.
+- All note and draft paths that Polaris records or prints are **absolute paths** in both default and override modes. Existing note records that still carry a relative `.polaris/docs/...` path from before this feature are not migrated; re-create them under the new root if you need the absolute form.
+- The selected root's `config.toml` takes precedence over `~/.polaris/config.toml` for hook recall prompts and maintenance prompts.
+- Unset `POLARIS_ROOT` to return to the default `<process-cwd>/.polaris` behavior. Polaris does not delete or modify the overridden store.
+
+Hook commands and any later agent-invoked `polaris recall` must inherit the same `POLARIS_ROOT` value, otherwise the hook reads one store and the recall command reads another. Use an absolute path in the hook environment so the value does not depend on the hook process's working directory.
+
+## Memory
 
 Inline memories are keyed. Use a short stable key such as `goal`, `plan`, `decision.storage`, `blocker`, or `verification`. Reusing a key fails unless `--replace` is provided, which makes overwrites explicit.
 
@@ -91,10 +114,10 @@ Use `remember --replace --dry-run` before important replacements when you want t
 
 ```bash
 polaris remember --key goal --replace --dry-run --text "updated task goal"
-polaris replace apply .polaris/maintenance/replace-goal-<id>.md --yes
+polaris replace apply <draft-path-from-dry-run-output> --yes
 ```
 
-Dry-run replacement creates an editable draft under `.polaris/maintenance/` and prints a preview diff. It does not mutate `.polaris/memories.jsonl` and does not write `.polaris/replacement-history.jsonl`. Applying the draft with `polaris replace apply ... --yes` uses the normal replacement path, including replacement metadata and history.
+Dry-run replacement creates an editable draft under `<selected-root>/maintenance/` and prints an **absolute** preview path. Always pass the absolute path printed by the create command to `polaris replace apply ... --yes`. Dry-run does not mutate `.polaris/memories.jsonl` and does not write `.polaris/replacement-history.jsonl`. Applying the draft uses the normal replacement path, including replacement metadata and history.
 
 Use `polaris touch` to refresh `updated_at` for still-valid records without changing text, lifecycle, `created_at`, replacement metadata, or note file contents:
 
@@ -129,10 +152,11 @@ Use `polaris forget <key>` or `polaris forget <key>...` to remove selected keyed
 
 Use `polaris rename <old-key> <new-key>` to rename a keyed inline memory without changing its text or metadata. Rename rejects missing sources and existing destination keys.
 
-Use `polaris merge --into <target-key> <source-key>...` to create an editable markdown draft under `.polaris/maintenance/`. Draft creation does not mutate active memory. Edit the text under `## Merged Memory`, then apply it explicitly:
+Use `polaris merge --into <target-key> <source-key>...` to create an editable markdown draft under `<selected-root>/maintenance/`. Draft creation does not mutate active memory. Edit the text under `## Merged Memory`, then apply the absolute draft path printed by the create command:
 
 ```bash
-polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes
+polaris merge apply <merge-draft-path> --yes
+polaris merge apply <merge-draft-path> --yes --forget-sources
 ```
 
 Add `--forget-sources` to remove the source keyed inline memories in the same confirmed apply operation. Invalid drafts and unconfirmed apply commands leave active memory unchanged.
@@ -220,16 +244,18 @@ If your CLI does not trigger a compact `SessionStart` hook after compaction, use
 
 The examples assume `polaris` is available on `PATH`. If you install the binary somewhere else, replace the `polaris hook ...` commands with the appropriate absolute command path.
 
+If you have set `POLARIS_ROOT` to override the storage location, make sure the hook process inherits the same absolute value; otherwise the hook reads `<hook-cwd>/.polaris` while later `polaris recall` commands read the overridden root. Use an absolute path in the hook environment so the value does not depend on the hook process's working directory.
+
 Run `polaris init` in a workspace before expecting hook output. If `.polaris/` is absent, hook commands exit successfully without output.
 
-To customize the hook prompt, add `[hooks].recall_prompt` to `.polaris/config.toml` in the workspace:
+To customize the hook prompt, add `[hooks].recall_prompt` to `<selected-root>/config.toml`. Without `POLARIS_ROOT` the selected root is `<process-cwd>/.polaris`; with an absolute `POLARIS_ROOT` it is that directory. The selected root's `config.toml` takes precedence over `~/.polaris/config.toml`; the two files are not merged:
 
 ```toml
 [hooks]
 recall_prompt = "Polaris has saved context. Run `polaris recall` before continuing."
 ```
 
-If `.polaris/config.toml` is absent, Polaris checks `~/.polaris/config.toml`. Workspace config takes precedence over user config; the two files are not merged. If neither file exists, Polaris uses the built-in prompt.
+If `<selected-root>/config.toml` is absent, Polaris checks `~/.polaris/config.toml`. If neither file exists, Polaris uses the built-in prompt.
 
 The only prompt placeholder is `{{recall}}`. When present, Polaris replaces every `{{recall}}` with the current `polaris recall` output and includes that text directly in hook context:
 

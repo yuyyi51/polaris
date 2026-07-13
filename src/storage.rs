@@ -9,6 +9,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 const POLARIS_DIR: &str = ".polaris";
+const POLARIS_ROOT_ENV: &str = "POLARIS_ROOT";
 const STATE_FILE: &str = "state.json";
 const HOOK_STATE_FILE: &str = "hook-state.json";
 const CONFIG_FILE: &str = "config.toml";
@@ -67,6 +68,7 @@ Compact suggestions:
 #[derive(Debug)]
 pub struct PolarisStore {
     workspace: PathBuf,
+    root: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -436,15 +438,17 @@ enum MaintenancePromptKind {
 
 impl PolarisStore {
     pub fn from_current_dir() -> Result<Self> {
-        Self::from_workspace(std::env::current_dir()?)
+        let workspace = std::env::current_dir()?;
+        Self::from_workspace(workspace)
     }
 
     pub fn from_workspace(workspace: PathBuf) -> Result<Self> {
-        Ok(Self { workspace })
+        let root = resolve_polaris_root(&workspace)?;
+        Ok(Self { workspace, root })
     }
 
     pub fn root(&self) -> PathBuf {
-        self.workspace.join(POLARIS_DIR)
+        self.root.clone()
     }
 
     pub fn init(&self) -> Result<()> {
@@ -643,8 +647,7 @@ impl PolarisStore {
         let _lock = self.lock_memories_exclusive()?;
         let id = new_id();
         let file_name = format!("{}-{}.md", id, slugify(title));
-        let relative_path = PathBuf::from(POLARIS_DIR).join(DOCS_DIR).join(&file_name);
-        let absolute_path = self.workspace.join(&relative_path);
+        let absolute_path = self.root().join(DOCS_DIR).join(&file_name);
         fs::write(&absolute_path, format!("# {title}\n\n"))?;
 
         let record = MemoryRecord {
@@ -659,13 +662,13 @@ impl PolarisStore {
             key: None,
             title: Some(title.to_string()),
             text: None,
-            path: Some(relative_path.display().to_string()),
+            path: Some(absolute_path.display().to_string()),
         };
         self.append_record(&record)?;
 
         Ok(CreatedNote {
             id,
-            path: relative_path,
+            path: absolute_path,
         })
     }
 
@@ -696,10 +699,7 @@ impl PolarisStore {
         fs::create_dir_all(self.maintenance_dir())?;
         let id = new_id();
         let file_name = format!("merge-{}-{}.md", slugify(target), id);
-        let relative_path = PathBuf::from(POLARIS_DIR)
-            .join(MAINTENANCE_DIR)
-            .join(file_name);
-        let absolute_path = self.workspace.join(&relative_path);
+        let absolute_path = self.root().join(MAINTENANCE_DIR).join(file_name);
         fs::write(
             &absolute_path,
             render_merge_draft(target, sources, &source_records)?,
@@ -707,7 +707,7 @@ impl PolarisStore {
 
         Ok(CreatedMergeDraft {
             id,
-            path: relative_path,
+            path: absolute_path,
         })
     }
 
@@ -731,10 +731,7 @@ impl PolarisStore {
         fs::create_dir_all(self.maintenance_dir())?;
         let id = new_id();
         let file_name = format!("replace-{}-{}.md", slugify(key), id);
-        let relative_path = PathBuf::from(POLARIS_DIR)
-            .join(MAINTENANCE_DIR)
-            .join(file_name);
-        let absolute_path = self.workspace.join(&relative_path);
+        let absolute_path = self.root().join(MAINTENANCE_DIR).join(file_name);
         fs::write(
             &absolute_path,
             render_replacement_draft(key, &current, text)?,
@@ -742,7 +739,7 @@ impl PolarisStore {
 
         Ok(CreatedReplacementDraft {
             id,
-            path: relative_path,
+            path: absolute_path,
             key: key.to_string(),
             diff: unified_diff(
                 "current",
@@ -2213,4 +2210,26 @@ fn slugify(title: &str) -> String {
     } else {
         slug
     }
+}
+
+fn resolve_polaris_root(workspace: &Path) -> Result<PathBuf> {
+    let Some(value) = std::env::var_os(POLARIS_ROOT_ENV) else {
+        return Ok(workspace.join(POLARIS_DIR));
+    };
+
+    let value = value.to_string_lossy();
+    if value.is_empty() {
+        return Err(anyhow!(
+            "{POLARIS_ROOT_ENV} must not be empty; unset it to use the default workspace root or set an absolute path"
+        ));
+    }
+
+    let candidate = PathBuf::from(value.as_ref());
+    if !candidate.is_absolute() {
+        return Err(anyhow!(
+            "{POLARIS_ROOT_ENV} must be an absolute path; got `{value}`"
+        ));
+    }
+
+    Ok(candidate)
 }

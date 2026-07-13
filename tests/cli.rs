@@ -1339,13 +1339,17 @@ fn remember_replace_dry_run_creates_editable_draft_without_mutating_memory() {
         .stdout(predicate::str::contains("-old goal"))
         .stdout(predicate::str::contains("+new goal"))
         .stdout(predicate::str::contains(
-            "Path: .polaris/maintenance/replace-goal-",
+            format!(
+                "Path: {}/.polaris/maintenance/replace-goal-",
+                dir.path().display()
+            )
+            .as_str(),
         ))
         .get_output()
         .stdout
         .clone();
     let draft_path = path_from_output(&output, "Path: ");
-    let draft = fs::read_to_string(dir.path().join(&draft_path)).expect("replace draft");
+    let draft = fs::read_to_string(&draft_path).expect("replace draft");
     assert!(draft.contains("polaris-replace-draft-v1"));
     assert!(draft.contains("key: goal"));
     assert!(draft.contains("## Current Memory"));
@@ -3826,6 +3830,919 @@ fn install_codex_skill_script_respects_override_and_replaces_existing_skill() {
         fs::read_to_string(bundled_skill).expect("bundled SKILL.md")
     );
     assert!(!stale_skill.join("local-only.txt").exists());
+}
+
+#[test]
+fn polaris_root_unset_uses_cwd_dot_polaris() {
+    let dir = temp_workspace();
+
+    polaris()
+        .current_dir(dir.path())
+        .env_remove("POLARIS_ROOT")
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            format!("Initialized Polaris at {}/.polaris", dir.path().display()).as_str(),
+        ));
+
+    assert!(dir.path().join(".polaris/state.json").is_file());
+    assert!(dir.path().join(".polaris/memories.jsonl").is_file());
+    assert!(dir.path().join(".polaris/docs").is_dir());
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env_remove("POLARIS_ROOT")
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&output).expect("status json");
+    assert_eq!(
+        status["root"].as_str().unwrap(),
+        format!("{}/.polaris", dir.path().display())
+    );
+}
+
+#[test]
+fn polaris_root_absolute_selects_custom_root_and_keeps_cwd_store_untouched() {
+    let dir = temp_workspace();
+    let custom_root = dir.path().join("custom-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            format!("Initialized Polaris at {custom_root_string}").as_str(),
+        ));
+
+    assert!(custom_root.join("state.json").is_file());
+    assert!(custom_root.join("memories.jsonl").is_file());
+    assert!(custom_root.join("docs").is_dir());
+    assert!(!dir.path().join(".polaris").exists());
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["remember", "--key", "goal", "--text", "isolated goal"])
+        .assert()
+        .success();
+    assert!(!dir.path().join(".polaris/memories.jsonl").exists());
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&output).expect("status json");
+    assert_eq!(status["root"].as_str().unwrap(), custom_root_string);
+    assert_eq!(status["memory_count"], 1);
+    assert_eq!(status["initialized"], true);
+}
+
+#[test]
+fn polaris_root_rejects_empty_value() {
+    let dir = temp_workspace();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", "")
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("POLARIS_ROOT"))
+        .stderr(predicate::str::contains("empty"));
+
+    assert!(!dir.path().join(".polaris").exists());
+}
+
+#[test]
+fn polaris_root_rejects_relative_value() {
+    let dir = temp_workspace();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", "relative/store")
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("POLARIS_ROOT"))
+        .stderr(predicate::str::contains("absolute"));
+
+    assert!(!dir.path().join(".polaris").exists());
+    assert!(!dir.path().join("relative").exists());
+}
+
+#[test]
+fn polaris_root_absolute_init_creates_missing_directory() {
+    let dir = temp_workspace();
+    let fresh_root = dir.path().join("nested/fresh-store");
+    let fresh_root_string = fresh_root.display().to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &fresh_root_string)
+        .arg("init")
+        .assert()
+        .success();
+
+    assert!(fresh_root.join("state.json").is_file());
+    assert!(fresh_root.join("memories.jsonl").is_file());
+    assert!(fresh_root.join("docs").is_dir());
+}
+
+#[test]
+fn polaris_root_absolute_init_preserves_existing_records() {
+    let dir = temp_workspace();
+    let custom_root = dir.path().join("shared-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["remember", "--key", "goal", "--text", "carry me"])
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("recall")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("carry me"));
+}
+
+#[test]
+fn note_path_is_absolute_in_default_and_override_modes() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env_remove("POLARIS_ROOT")
+        .args(["note", "create", "--title", "Default note"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let default_path = path_from_output(&output, "Path: ");
+    assert!(default_path.starts_with(dir.path().to_str().unwrap()));
+    assert!(Path::new(&default_path).is_absolute());
+    assert!(Path::new(&default_path).is_file());
+
+    let custom_root = dir.path().join("override-store");
+    let custom_root_string = custom_root.display().to_string();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["note", "create", "--title", "Override note"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let override_path = path_from_output(&output, "Path: ");
+    assert!(Path::new(&override_path).is_absolute());
+    assert!(Path::new(&override_path).starts_with(&custom_root));
+    assert!(Path::new(&override_path).is_file());
+}
+
+#[test]
+fn hook_session_start_uses_payload_cwd_when_root_unset() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["remember", "--key", "secret", "--text", "payload memory"])
+        .assert()
+        .success();
+    fs::write(
+        dir.path().join(".polaris/config.toml"),
+        "[hooks]\nrecall_prompt = \"Before\\n{{recall}}\\nAfter\"\n",
+    )
+    .expect("write workspace config");
+
+    let compact_input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env_remove("POLARIS_ROOT")
+        .args(["hook", "session-start"])
+        .write_stdin(compact_input.as_str())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let context = hook_context(&output);
+    assert!(context.contains("payload memory"));
+}
+
+#[test]
+fn hook_session_start_uses_absolute_root_override_over_payload_cwd() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    let custom_root = dir.path().join("hook-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["remember", "--key", "secret", "--text", "override memory"])
+        .assert()
+        .success();
+    fs::write(
+        custom_root.join("config.toml"),
+        "[hooks]\nrecall_prompt = \"Before\\n{{recall}}\\nAfter\"\n",
+    )
+    .expect("write root config");
+
+    let compact_input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["hook", "session-start"])
+        .write_stdin(compact_input.as_str())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let context = hook_context(&output);
+    assert!(context.contains("override memory"));
+    assert!(!context.contains("payload memory"));
+    assert!(!dir.path().join(".polaris/memories.jsonl").exists());
+}
+
+#[test]
+fn fallback_hooks_share_pending_state_under_absolute_root_override() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    let custom_root = dir.path().join("fallback-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["remember", "--key", "secret", "--text", "fallback memory"])
+        .assert()
+        .success();
+    fs::write(
+        custom_root.join("config.toml"),
+        "[hooks]\nrecall_prompt = \"Before\\n{{recall}}\\nAfter\"\n",
+    )
+    .expect("write root config");
+
+    let post_compact_input = serde_json::json!({
+        "hook_event_name": "PostCompact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["hook", "post-compact"])
+        .write_stdin(post_compact_input.as_str())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    let post_tool_use_input = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["hook", "post-tool-use"])
+        .write_stdin(post_tool_use_input.as_str())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let context = hook_context(&output);
+    assert!(context.contains("fallback memory"));
+
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["hook", "post-tool-use"])
+        .write_stdin(post_tool_use_input.as_str())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    assert!(!dir.path().join(".polaris/hook-state.json").exists());
+}
+
+#[test]
+fn root_config_takes_precedence_over_user_config_under_absolute_root_override() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    let custom_root = dir.path().join("config-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    fs::create_dir_all(home.path().join(".polaris")).expect("user polaris home");
+    fs::write(
+        home.path().join(".polaris/config.toml"),
+        "[hooks]\nrecall_prompt = \"USER_PROMPT\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(&custom_root).expect("custom root");
+    fs::write(
+        custom_root.join("config.toml"),
+        "[hooks]\nrecall_prompt = \"ROOT_PROMPT\"\n",
+    )
+    .unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["remember", "--key", "secret", "--text", "config memory"])
+        .assert()
+        .success();
+
+    let compact_input = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+        "cwd": dir.path(),
+    })
+    .to_string();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["hook", "session-start"])
+        .write_stdin(compact_input.as_str())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ROOT_PROMPT"))
+        .stdout(predicate::str::contains("USER_PROMPT").not());
+}
+
+#[test]
+fn store_backed_commands_write_no_cwd_files_under_absolute_root_override() {
+    let dir = temp_workspace();
+    let custom_root = dir.path().join("isolated-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["remember", "--key", "goal", "--text", "private goal"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--replace",
+            "--text",
+            "private goal v2",
+        ])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--replace",
+            "--dry-run",
+            "--text",
+            "v3 draft",
+        ])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["touch", "--key", "goal"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["cite", "--key", "goal", "--quiet"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["note", "create", "--title", "Override note"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["merge", "--into", "merged", "goal"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["prune", "--suggest"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["compact", "--suggest"])
+        .assert()
+        .success();
+
+    assert!(!dir.path().join(".polaris").exists());
+    assert!(custom_root.join("state.json").is_file());
+    assert!(custom_root.join("memories.jsonl").is_file());
+    assert!(custom_root.join("replacement-history.jsonl").is_file());
+    assert!(custom_root.join("citations.jsonl").is_file());
+    assert!(custom_root.join("memories.lock").is_file());
+    assert!(custom_root.join("docs").is_dir());
+    assert!(custom_root.join("maintenance").is_dir());
+}
+
+#[test]
+fn hook_falls_back_to_process_cwd_when_payload_cwd_is_missing() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    init_workspace(dir.path());
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .args(["remember", "--key", "secret", "--text", "fallback memory"])
+        .assert()
+        .success();
+    fs::write(
+        dir.path().join(".polaris/config.toml"),
+        "[hooks]\nrecall_prompt = \"Before\\n{{recall}}\\nAfter\"\n",
+    )
+    .expect("write workspace config");
+
+    let input_without_cwd = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env_remove("POLARIS_ROOT")
+        .args(["hook", "session-start"])
+        .write_stdin(input_without_cwd.as_str())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let context = hook_context(&output);
+    assert!(context.contains("fallback memory"));
+}
+
+#[test]
+fn hook_uses_absolute_root_override_when_payload_cwd_is_missing() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    let other_cwd = temp_workspace();
+    let custom_root = dir.path().join("override-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["remember", "--key", "secret", "--text", "override memory"])
+        .assert()
+        .success();
+    fs::write(
+        custom_root.join("config.toml"),
+        "[hooks]\nrecall_prompt = \"Before\\n{{recall}}\\nAfter\"\n",
+    )
+    .expect("write root config");
+
+    let input_without_cwd = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "source": "compact",
+    })
+    .to_string();
+    let output = polaris()
+        .current_dir(other_cwd.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["hook", "session-start"])
+        .write_stdin(input_without_cwd.as_str())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let context = hook_context(&output);
+    assert!(context.contains("override memory"));
+}
+
+#[test]
+fn root_maintenance_prompts_take_precedence_under_absolute_root_override() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    let custom_root = dir.path().join("maint-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    fs::create_dir_all(home.path().join(".polaris")).expect("user polaris home");
+    fs::write(
+        home.path().join(".polaris/config.toml"),
+        r#"[maintenance.prompts]
+prune = "USER_PRUNE_PROMPT"
+compact = "USER_COMPACT_PROMPT"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(&custom_root).expect("custom root");
+    fs::write(
+        custom_root.join("config.toml"),
+        r#"[maintenance.prompts]
+prune = "ROOT_PRUNE_PROMPT"
+compact = "ROOT_COMPACT_PROMPT"
+"#,
+    )
+    .unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["remember", "--key", "stale.state", "--text", "stale"])
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["prune", "--suggest"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("ROOT_PRUNE_PROMPT"));
+    assert!(!output.contains("USER_PRUNE_PROMPT"));
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["compact", "--suggest"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("ROOT_COMPACT_PROMPT"));
+    assert!(!output.contains("USER_COMPACT_PROMPT"));
+}
+
+#[test]
+fn user_maintenance_prompts_apply_when_root_config_is_absent_under_override() {
+    let dir = temp_workspace();
+    let home = temp_workspace();
+    let custom_root = dir.path().join("maint-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    fs::create_dir_all(home.path().join(".polaris")).expect("user polaris home");
+    fs::write(
+        home.path().join(".polaris/config.toml"),
+        r#"[maintenance.prompts]
+prune = "USER_PRUNE_PROMPT"
+compact = "USER_COMPACT_PROMPT"
+"#,
+    )
+    .unwrap();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["prune", "--suggest"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("USER_PRUNE_PROMPT"));
+}
+
+#[test]
+fn note_path_recorded_in_jsonl_is_absolute() {
+    let dir = temp_workspace();
+    init_workspace(dir.path());
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env_remove("POLARIS_ROOT")
+        .args(["note", "create", "--title", "Default path test"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let printed = path_from_output(&output, "Path: ");
+    let records = assert_jsonl_records(&dir.path().join(".polaris/memories.jsonl"), 1);
+    let recorded = records[0]["path"].as_str().expect("note path");
+    assert!(Path::new(recorded).is_absolute());
+    assert_eq!(recorded, printed);
+
+    let custom_root = dir.path().join("absolute-store");
+    let custom_root_string = custom_root.display().to_string();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["note", "create", "--title", "Override path test"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let printed_override = path_from_output(&output, "Path: ");
+    let records = assert_jsonl_records(&custom_root.join("memories.jsonl"), 1);
+    let recorded_override = records[0]["path"].as_str().expect("note path");
+    assert!(Path::new(recorded_override).is_absolute());
+    assert_eq!(recorded_override, printed_override);
+    assert!(Path::new(recorded_override).starts_with(&custom_root));
+}
+
+#[test]
+fn replacement_draft_can_be_edited_and_applied_under_absolute_root_override() {
+    let dir = temp_workspace();
+    let custom_root = dir.path().join("replace-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--text",
+            "old goal",
+            "--lifecycle",
+            "state",
+        ])
+        .assert()
+        .success();
+    let initial = assert_jsonl_records(&custom_root.join("memories.jsonl"), 1);
+    let initial_id = initial[0]["id"].as_str().expect("initial id").to_string();
+    let created_at = initial[0]["created_at"].clone();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args([
+            "remember",
+            "--key",
+            "goal",
+            "--replace",
+            "--dry-run",
+            "--text",
+            "draft goal",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let draft_path = path_from_output(&output, "Path: ");
+    assert!(Path::new(&draft_path).is_absolute());
+    let draft = fs::read_to_string(&draft_path).expect("read replace draft");
+    assert!(draft.contains("polaris-replace-draft-v1"));
+    let edited = draft.replace("draft goal", "edited override goal");
+    fs::write(&draft_path, edited).expect("write edited replace draft");
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["replace", "apply", &draft_path, "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Applied replacement draft to goal",
+        ));
+
+    let records = assert_jsonl_records(&custom_root.join("memories.jsonl"), 1);
+    assert_eq!(records[0]["key"], "goal");
+    assert_eq!(records[0]["text"], "edited override goal");
+    assert_eq!(records[0]["created_at"], created_at);
+    assert_eq!(records[0]["lifecycle"], "state");
+    assert_eq!(records[0]["replacement_count"], 1);
+    assert_eq!(records[0]["replaced_from"], initial_id);
+
+    let history = assert_jsonl_records(&custom_root.join("replacement-history.jsonl"), 1);
+    assert_eq!(history[0]["id"], initial_id);
+    assert_eq!(history[0]["text"], "old goal");
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["diff", "--key", "goal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("-old goal"))
+        .stdout(predicate::str::contains("+edited override goal"));
+
+    assert!(!dir.path().join(".polaris").exists());
+}
+
+#[test]
+fn merge_draft_can_be_edited_and_applied_under_absolute_root_override() {
+    let dir = temp_workspace();
+    let custom_root = dir.path().join("merge-store");
+    let custom_root_string = custom_root.display().to_string();
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .arg("init")
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["remember", "--key", "a", "--text", "alpha body"])
+        .assert()
+        .success();
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["remember", "--key", "b", "--text", "beta body"])
+        .assert()
+        .success();
+
+    let output = polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["merge", "--into", "ab.summary", "a", "b"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let draft_path = path_from_output(&output, "Path: ");
+    assert!(Path::new(&draft_path).is_absolute());
+    let draft = fs::read_to_string(&draft_path).expect("read merge draft");
+    assert!(draft.contains("polaris-merge-draft-v1"));
+    let edited = draft.replace(
+        "From a:\nalpha body\n\nFrom b:\nbeta body\n\n",
+        "Merged override: alpha + beta\n",
+    );
+    fs::write(&draft_path, edited).expect("write edited merge draft");
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["merge", "apply", &draft_path, "--yes", "--forget-sources"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Applied merge draft to ab.summary",
+        ));
+
+    let records = assert_jsonl_records(&custom_root.join("memories.jsonl"), 1);
+    assert_eq!(records[0]["key"], "ab.summary");
+    assert_eq!(records[0]["text"], "Merged override: alpha + beta");
+
+    polaris()
+        .current_dir(dir.path())
+        .env("POLARIS_ROOT", &custom_root_string)
+        .args(["list", "--keys"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ab.summary"))
+        .stdout(predicate::str::contains("a\n").not())
+        .stdout(predicate::str::contains("b\n").not());
+
+    assert!(!dir.path().join(".polaris").exists());
 }
 
 fn run_install_skill_script<const N: usize>(envs: [(&str, &str); N]) {

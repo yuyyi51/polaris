@@ -114,16 +114,16 @@ Create a merge draft when several keyed memories should become one durable summa
 polaris merge --into decision.summary decision.storage decision.hooks
 ```
 
-Open the returned `.polaris/maintenance/` draft path, edit only the text under `## Merged Memory`, then apply it with confirmation:
+Open the absolute draft path returned by the create command, edit only the text under `## Merged Memory`, then apply it with confirmation:
 
 ```bash
-polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes
+polaris merge apply <merge-draft-path> --yes
 ```
 
 Use `--forget-sources` only when the merged target fully replaces the source keys:
 
 ```bash
-polaris merge apply .polaris/maintenance/merge-decision-summary-<id>.md --yes --forget-sources
+polaris merge apply <merge-draft-path> --yes --forget-sources
 ```
 
 Suggestion commands are read-only. Use them to decide what to inspect, rename, merge, or forget:
@@ -191,10 +191,10 @@ For important durable replacements, preview first and apply the editable draft o
 
 ```bash
 polaris remember --key goal --replace --dry-run --text "Implement keyed memory replacement, review drafts, and stale-state refresh."
-polaris replace apply .polaris/maintenance/replace-goal-<id>.md --yes
+polaris replace apply <replace-draft-path> --yes
 ```
 
-Dry-run replacement creates a draft under `.polaris/maintenance/`, prints a diff, and leaves active memory and replacement history unchanged until `replace apply --yes`.
+Dry-run replacement creates a draft under `<selected-root>/maintenance/`, prints an absolute path and a diff, and leaves active memory and replacement history unchanged until `replace apply --yes`.
 
 After replacing important durable memory, review the latest change before relying on it:
 
@@ -241,6 +241,24 @@ polaris remember --key state.branch --replace --text "Currently implementing add
 
 Refresh memory before major pauses, risky edits, or handoffs.
 
+## Custom Storage Root
+
+By default Polaris stores every artifact under `<process-cwd>/.polaris/`. To share a single store across workspaces or processes, set `POLARIS_ROOT` to an **absolute path**. The same value is used by every store-backed CLI command and by every `polaris hook` command.
+
+```bash
+export POLARIS_ROOT=/absolute/path/to/polaris-store
+polaris init
+```
+
+Rules:
+
+- The value must be an absolute path. Relative values are rejected before any data is mutated.
+- An empty value is rejected. Unset the variable to return to the default `<process-cwd>/.polaris` root.
+- Note and draft paths that Polaris records or prints are absolute paths in both default and override modes.
+- The selected root's `config.toml` takes precedence over `~/.polaris/config.toml` for hook prompts and maintenance prompts.
+
+When `POLARIS_ROOT` is set, the hook process and any later `polaris recall` invocation must inherit the same absolute value, otherwise they read different stores. Use an absolute path so the value does not depend on the hook process's working directory.
+
 ## Safety
 
-Do not store secrets, tokens, passwords, credentials, private keys, or other sensitive material in Polaris. Polaris stores plaintext local files under `.polaris/`.
+Do not store secrets, tokens, passwords, credentials, private keys, or other sensitive material in Polaris. Polaris stores plaintext local files under the selected root.
