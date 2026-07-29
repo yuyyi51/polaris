@@ -947,4 +947,3 @@ The system SHALL keep every newly created store artifact under the selected Pola
 - **WHEN** a command writes replacement history, citations, memory locks, or hook state with `POLARIS_ROOT`
 - **THEN** each file is written under the selected root
 - **AND** no corresponding auxiliary file is written under `<process-cwd>/.polaris`
-
